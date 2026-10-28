@@ -1,0 +1,157 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sirocco-sys",
+    "crates/sirocco-core",
+    "crates/sirocco-engine",
+    "crates/sirocco-cli",
+    "crates/sirocco-gui",
+]
+# The GUI is deliberately *not* a default member: iced pulls in wgpu, winit,
+# wayland and X11, which a headless build machine usually cannot satisfy. Plain
+# `cargo build` / `cargo test` stay dependency-free; the GUI is built explicitly
+# with `cargo build -p sirocco-gui`.
+default-members = [
+    "crates/sirocco-sys",
+    "crates/sirocco-core",
+    "crates/sirocco-engine",
+    "crates/sirocco-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Sirocco is an application, not a library: nobody compiles against it, so the
+# floor only has to be recent enough to build, not low enough to embed. Keeping
+# it at the second-newest release is what lets `cargo update` take a dependency
+# whose own MSRV moved up.
+rust-version = "1.90"
+authors = [
+    "Xinyu Yang <Xinyu.Yang@apich.org>",
+    "Apich Organization <info@apich.org>",
+    "Sirocco Contributors",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Apich-Organization/sirocco"
+homepage = "https://github.com/Apich-Organization/sirocco"
+documentation = "https://docs.rs/sirocco-core"
+readme = "README.md"
+description = "A low-level file copy engine for Windows and Linux: direct I/O, kernel-assisted small-file copies, and a measured choice between full copy and block-level delta."
+categories = [
+    "command-line-utilities",
+    "filesystem",
+    "os::windows-apis",
+    "os::unix-apis",
+]
+keywords = ["copy", "file", "iocp", "io-uring", "sync"]
+exclude = [
+    "/.github",
+    "/.workbuddy-ai",
+    "/.build_tmp",
+    "/target",
+    "*.mp4",
+    "*.png",
+]
+
+[workspace.dependencies]
+sirocco-sys = { path = "crates/sirocco-sys" }
+sirocco-core = { path = "crates/sirocco-core" }
+sirocco-engine = { path = "crates/sirocco-engine" }
+# The only external crates in the tree. They are declared once, here, so that a
+# version requirement is never duplicated across a crate's manifest and can be
+# bumped in one place.
+libc = "0.2"
+iced = { version = "0.14", features = ["canvas", "tokio"] }
+# Native folder picker. `default-features = false` keeps the Linux build on the
+# pure-Rust XDG portal instead of dragging in GTK.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+debug = 1
+strip = "debuginfo"
+
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = 2
+
+[profile.dev]
+opt-level = 1
+debug = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# ==============================================================================
+# Lint policy
+# ==============================================================================
+#
+# Every level here is `deny`, not `forbid`, on purpose. `forbid` cannot be
+# overridden by an `#[allow]` in source — rustc rejects it with
+# "allow(..) incompatible with previous forbid" — which leaves no way to record a
+# deliberate exception. `deny` fails the build exactly the same way, while still
+# permitting a justified, module-scoped `#[allow]` where a lint fights the
+# domain. Those exceptions are listed, with their reasons, at the top of the
+# crate that needs them; there is no blanket suppression anywhere.
+#
+# The only lints kept at `forbid` are the ones that are always satisfiable and
+# that indicate a genuine defect: unreachable code, a wrong C ABI, edition
+# incompatibilities, and naming.
+
+[workspace.lints.rust]
+# --- always satisfiable, so these stay absolute ------------------------------
+unreachable_code = "forbid"
+improper_ctypes_definitions = "forbid"
+future_incompatible = { level = "forbid", priority = -1 }
+# `deny`, not `forbid`: the FFI bindings must keep `CreateFileW` and friends
+# spelled the way the headers spell them, and only an `#[allow]` in that module
+# can say so.
+nonstandard_style = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "forbid", priority = -1 }
+# --- enforced, but overridable where documented ------------------------------
+missing_docs = "deny"
+dead_code = "warn"
+warnings = { level = "warn", priority = -1 }
+# `unsafe` is confined to `sirocco-sys`; that crate allows this lint at the crate
+# root and explains why. Everything above it is safe code.
+unsafe_code = "warn"
+unused_doc_comments = "allow"
+
+[workspace.lints.clippy]
+# --- correctness family: no exceptions anywhere ------------------------------
+correctness = "deny"
+suspicious = "deny"
+perf = "deny"
+missing_safety_doc = "deny"
+same_item_push = "deny"
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+# --- enforced, but overridable where the crate explains why ------------------
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+implicit_clone = "deny"
+single_call_fn = "deny"
+# --- warnings only -----------------------------------------------------------
+dbg_macro = { level = "warn", priority = 1 }
+todo = { level = "warn", priority = 1 }
+unnecessary_safety_comment = { level = "warn", priority = 1 }
+# --- noise for a systems crate ----------------------------------------------
+restriction = { level = "allow", priority = -1 }
+inline_always = { level = "allow", priority = 1 }
+cast_possible_truncation = { level = "allow", priority = 1 }
+cast_sign_loss = { level = "allow", priority = 1 }
+cast_possible_wrap = { level = "allow", priority = 1 }
+empty_line_after_doc_comments = { level = "allow", priority = 1 }

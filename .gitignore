@@ -1,0 +1,14 @@
+# Build output
+/target
+
+# Trees left behind by the end-to-end tests, and shared-memory segments from a
+# `--procs` run that was killed before it could clean up.
+/sirocco-e2e
+*.shm
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.workbuddy-ai/

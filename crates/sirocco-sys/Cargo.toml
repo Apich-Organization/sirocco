@@ -1,0 +1,20 @@
+[package]
+name = "sirocco-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Raw platform layer for Sirocco: direct I/O, IOCP, io_uring, affinity, privileges"
+
+[dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[features]
+default = []
+# Force-enable verbose platform tracing at compile time.
+trace = []
+
+[lints]
+workspace = true

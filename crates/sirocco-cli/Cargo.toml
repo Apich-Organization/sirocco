@@ -1,0 +1,19 @@
+[package]
+name = "sirocco-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sirocco command line interface"
+
+[[bin]]
+name = "sirocco"
+path = "src/main.rs"
+
+[dependencies]
+sirocco-sys.workspace = true
+sirocco-core.workspace = true
+sirocco-engine.workspace = true
+
+[lints]
+workspace = true

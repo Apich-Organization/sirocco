@@ -1,0 +1,38 @@
+repos:
+- repo: https://github.com/gitleaks/gitleaks
+  rev: v8.30.1
+  hooks:
+  - id: gitleaks
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+  - id: check-yaml
+  - id: check-toml
+  - id: check-merge-conflict
+  - id: mixed-line-ending
+    args: [--fix=lf]
+- repo: https://github.com/jumanjihouse/pre-commit-hooks
+  rev: 3.0.0
+  hooks:
+  - id: shellcheck
+- repo: local
+  hooks:
+  # `cargo fmt --check` rather than `cargo fmt`: a pre-commit hook that rewrites
+  # the tree makes the commit message a lie about what was reviewed.
+  - id: cargo-fmt
+    name: cargo fmt --check
+    entry: cargo fmt --all -- --check
+    language: system
+    types: [rust]
+    pass_filenames: false
+  # The GUI is excluded from the default members, so it needs `--workspace` to be
+  # linted at all; `--all-targets` includes the tests and the example.
+  - id: cargo-clippy
+    name: cargo clippy
+    entry: cargo clippy --workspace --all-targets -- -D warnings
+    language: system
+    types: [rust]
+    pass_filenames: false
+    stages: [pre-push]
