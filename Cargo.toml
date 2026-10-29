@@ -34,7 +34,6 @@ authors = [
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Apich-Organization/sirocco"
 homepage = "https://github.com/Apich-Organization/sirocco"
-documentation = "https://docs.rs/sirocco-core"
 readme = "README.md"
 description = "A low-level file copy engine for Windows and Linux: direct I/O, kernel-assisted small-file copies, and a measured choice between full copy and block-level delta."
 categories = [
@@ -73,7 +72,7 @@ codegen-units = 1
 panic = "abort"
 overflow-checks = false
 debug = 1
-strip = "debuginfo"
+strip = true
 
 [profile.release-fast]
 inherits = "release"
@@ -91,6 +90,7 @@ debug = 2
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = 1
 
 # ==============================================================================
 # Lint policy
