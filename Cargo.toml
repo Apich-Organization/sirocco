@@ -53,9 +53,9 @@ exclude = [
 ]
 
 [workspace.dependencies]
-sirocco-sys = { path = "crates/sirocco-sys" }
-sirocco-core = { path = "crates/sirocco-core" }
-sirocco-engine = { path = "crates/sirocco-engine" }
+sirocco-sys = { path = "crates/sirocco-sys", version = "0.1" }
+sirocco-core = { path = "crates/sirocco-core", version = "0.1" }
+sirocco-engine = { path = "crates/sirocco-engine", version = "0.1" }
 # The only external crates in the tree. They are declared once, here, so that a
 # version requirement is never duplicated across a crate's manifest and can be
 # bumped in one place.
