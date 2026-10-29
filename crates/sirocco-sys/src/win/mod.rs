@@ -56,9 +56,11 @@ use ffi::FILE_FLAG_OVERLAPPED;
 use ffi::FILE_FLAG_SEQUENTIAL_SCAN;
 use ffi::FILE_FLAG_WRITE_THROUGH;
 use ffi::FILE_IO_PRIORITY_HINT_INFO;
+use ffi::FILE_READ_ATTRIBUTES;
 use ffi::FILE_SHARE_DELETE;
 use ffi::FILE_SHARE_READ;
 use ffi::FILE_SHARE_WRITE;
+use ffi::FILE_WRITE_ATTRIBUTES;
 use ffi::FILE_ZERO_DATA_INFORMATION;
 use ffi::FILETIME;
 use ffi::FSCTL_GET_RETRIEVAL_POINTERS;
@@ -253,6 +255,15 @@ impl RawFile {
     ) -> io::Result<Self> {
         let (mut access, disp) = match (opts.access, opts.create) {
             | (Access::Read, _) => (GENERIC_READ, OPEN_EXISTING),
+            // `SetFileTime` and `SetFileInformationByHandle` need
+            // FILE_WRITE_ATTRIBUTES, which a read-only file still grants; a
+            // GENERIC_WRITE handle on such a file is refused outright.
+            | (Access::Attributes, _) => {
+                (
+                    FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
+                    OPEN_EXISTING,
+                )
+            },
             | (Access::Write, Create::Open) => (GENERIC_WRITE, OPEN_EXISTING),
             | (Access::Write, Create::CreateNew) => (GENERIC_WRITE, CREATE_NEW),
             | (Access::Write, Create::Create) => (GENERIC_WRITE, CREATE_ALWAYS),
@@ -1779,6 +1790,32 @@ pub fn file_identity(path: &Path) -> io::Result<(u64, u32)> {
     Ok((
         u64::from_le_bytes(id_info[8..16].try_into().unwrap()),
         links,
+    ))
+}
+
+/// Whether this platform can copy extended attributes.
+///
+/// Windows has no equivalent of the POSIX xattr namespace. NTFS alternate data
+/// streams are a different feature with different semantics, and silently
+/// copying them because the user asked for `--xattrs` would be a surprise, so
+/// the engine refuses the option up front.
+#[must_use]
+pub const fn xattrs_supported() -> bool {
+    false
+}
+
+/// Copy extended attributes.
+///
+/// Unreachable in practice — `xattrs_supported` is false and the engine turns
+/// the option off before the pipeline starts — but the platform surface has to
+/// be uniform for the caller to compile.
+pub fn copy_xattrs(
+    _src: &Path,
+    _dst: &RawFile,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "extended attributes are not supported on Windows",
     ))
 }
 

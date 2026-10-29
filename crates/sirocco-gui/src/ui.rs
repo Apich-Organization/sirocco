@@ -24,14 +24,22 @@ use iced::widget::slider;
 use iced::widget::text;
 use iced::widget::text_input;
 
+use sirocco_core::hash::HashKind;
 use sirocco_core::plan::Mode;
 use sirocco_core::plan::Order;
 use sirocco_core::plan::Overwrite;
 use sirocco_core::plan::VerifyMode;
+use sirocco_engine::config::CompressMode;
+use sirocco_engine::config::IndexMode;
+use sirocco_engine::config::PreallocMode;
+use sirocco_engine::config::SmallCopy;
+use sirocco_sys::ReactorKind;
 
 use crate::App;
 use crate::FileRow;
+use crate::HugeChoice;
 use crate::Message;
+use crate::NumaChoice;
 use crate::Phase;
 use crate::RowState;
 use crate::charts;
@@ -113,6 +121,8 @@ fn rail(app: &App) -> Element<'_, Message> {
         text("fast, low-level file copy").size(11).color(th::FAINT),
         gap(16.0),
         modes(app),
+        gap(12.0),
+        advanced_toggle(app),
     ];
 
     if let Some((msg, color)) = app.caveat() {
@@ -139,16 +149,21 @@ fn rail(app: &App) -> Element<'_, Message> {
             !app.is_running(),
         ));
 
-    // `into` only means something when the source is a folder.
+    // `into` only means something when the source is a folder. It is also
+    // settled before the scan runs, so flipping it mid-job would change nothing
+    // while looking like it did.
     if std::path::Path::new(app.src.trim()).is_dir() {
-        col = col.push(gap(6.0)).push(
-            checkbox(app.into)
-                .label("Copy the folder itself into the destination")
-                .on_toggle(Message::Into)
-                .size(15)
-                .text_size(th::T_BODY)
-                .style(th::checkbox_style),
-        );
+        let boxed: iced::widget::Checkbox<'_, Message> = checkbox(app.into)
+            .label("Copy the folder itself into the destination")
+            .size(15)
+            .text_size(th::T_BODY)
+            .style(th::checkbox_style);
+        let boxed: Element<'_, Message> = if app.is_running() {
+            boxed.into()
+        } else {
+            boxed.on_toggle(Message::Into).into()
+        };
+        col = col.push(gap(6.0)).push(boxed);
     }
 
     col = col
@@ -167,10 +182,24 @@ fn rail(app: &App) -> Element<'_, Message> {
         ))
         .push(gap(12.0))
         .push(choice(
+            "DIGEST",
+            &HASH_OPTS,
+            hash_label(app.hash),
+            hash_from,
+        ))
+        .push(gap(12.0))
+        .push(choice(
             "OVERWRITE",
             &OVERWRITE_OPTS,
             overwrite_label(app.overwrite),
             overwrite_from,
+        ))
+        .push(gap(12.0))
+        .push(choice(
+            "BLOCK INDEX",
+            &INDEX_OPTS,
+            index_label(app.index),
+            index_from,
         ))
         .push(gap(12.0))
         .push(eyebrow("EXCLUDE"))
@@ -206,6 +235,38 @@ fn rail(app: &App) -> Element<'_, Message> {
         .push(gap(16.0))
         .push(divider());
 
+    if app.advanced {
+        col = col
+            .push(gap(12.0))
+            .push(engine_group(app))
+            .push(gap(14.0))
+            .push(divider())
+            .push(gap(14.0))
+            .push(parallel_group(app))
+            .push(gap(14.0))
+            .push(divider())
+            .push(gap(14.0))
+            .push(delta_group(app))
+            .push(gap(14.0))
+            .push(divider())
+            .push(gap(14.0))
+            .push(scheduling_group(app))
+            .push(gap(14.0))
+            .push(divider())
+            .push(gap(14.0))
+            .push(fidelity_group(app))
+            .push(gap(14.0))
+            .push(divider())
+            .push(gap(14.0))
+            .push(filters_group(app))
+            .push(gap(14.0))
+            .push(divider())
+            .push(gap(14.0))
+            .push(privileges_group(app));
+    }
+
+    col = col.push(gap(16.0)).push(divider());
+
     // The actions live outside the scroll region: a Start button you have to
     // scroll to find is a broken Start button. A validation error belongs right
     // above it, not buried in the options.
@@ -213,11 +274,16 @@ fn rail(app: &App) -> Element<'_, Message> {
     if let Some(err) = &app.error {
         footer = footer.push(notice(err, th::ERR)).push(gap(8.0));
     }
-    let footer = footer.push(actions(app)).push(gap(8.0)).push(
+    let mut footer = footer.push(actions(app)).push(gap(8.0)).push(
         text(format!("{} · {} cores", app.caps, app.cores))
             .size(10)
             .color(th::FAINT),
     );
+    if let Some(note) = &app.priv_note {
+        footer = footer
+            .push(gap(3.0))
+            .push(text(note).size(10).color(th::FAINT));
+    }
 
     container(column![
         scrollable(gutter(col))
@@ -431,6 +497,28 @@ fn choice<'a>(
     .into()
 }
 
+/// `choice`, for a list computed at render time.
+///
+/// The list is owned rather than borrowed because it depends on another control
+/// (the buffer size); `pick_list` takes it by value, so nothing dangles.
+fn choice_owned<'a>(
+    label: &'a str,
+    options: Vec<&'a str>,
+    selected: &'a str,
+    on: fn(&str) -> Message,
+) -> Element<'a, Message> {
+    column![
+        eyebrow(label),
+        gap(6.0),
+        pick_list(options, Some(selected), on)
+            .padding([7, 10])
+            .text_size(th::T_BODY)
+            .style(th::pick)
+            .width(Length::Fill),
+    ]
+    .into()
+}
+
 fn toggles(app: &App) -> Element<'_, Message> {
     let mut c = column![].spacing(6);
     for (label, value, msg) in [
@@ -441,38 +529,706 @@ fn toggles(app: &App) -> Element<'_, Message> {
         ),
         ("Punch holes for empty regions", app.sparse, Message::Sparse),
         ("Copy permissions and ACLs", app.acl, Message::Acl),
-        (
-            "Remember block hashes (faster resync)",
-            app.index,
-            Message::Index,
-        ),
         ("Resume journal", app.journal, Message::Journal),
         ("Flush to disk before finishing", app.sync, Message::Sync),
         ("Plan only — change nothing", app.dry_run, Message::DryRun),
     ] {
-        let boxed: iced::widget::Checkbox<'_, Message> = checkbox(value)
-            .label(label)
-            .size(15)
-            .text_size(th::T_BODY)
-            .style(th::checkbox_style);
-        // A toggle that changes nothing until the next run is a lie while the
-        // current one is still going.
-        let row: Element<'_, Message> = if app.is_running() {
-            boxed.into()
-        } else {
-            boxed.on_toggle(msg).into()
-        };
-        c = c.push(row);
+        c = c.push(toggle_one(app, label, value, msg));
     }
     c.into()
 }
 
-fn threads_row(app: &App) -> Element<'_, Message> {
-    let (r, w) = app.resolved_threads();
-    let shown = if app.threads == 0 {
-        format!("auto · {r}+{w}")
+/// One checkbox row. A toggle that changes nothing until the next run is a lie
+/// while the current one is still going, so it loses its handler instead.
+fn toggle_one<'a>(
+    app: &'a App,
+    label: &'a str,
+    value: bool,
+    on: fn(bool) -> Message,
+) -> Element<'a, Message> {
+    let boxed: iced::widget::Checkbox<'_, Message> = checkbox(value)
+        .label(label)
+        .size(15)
+        .text_size(th::T_BODY)
+        .style(th::checkbox_style);
+    if app.is_running() {
+        boxed.into()
     } else {
-        format!("{r}+{w}")
+        boxed.on_toggle(on).into()
+    }
+}
+
+/// A labelled integer slider, used where the value is a small count.
+///
+/// Always live, like the thread slider: a slider only writes the value the next
+/// run will use, so freezing it mid-run would hide the setting without protecting
+/// anything.
+fn num_row(
+    label: &str,
+    range: std::ops::RangeInclusive<f32>,
+    value: u32,
+    shown: String,
+    on: fn(u32) -> Message,
+) -> Element<'_, Message> {
+    column![
+        row![
+            text(label).size(th::T_BODY).color(th::MUTED),
+            spacer(),
+            text(shown).size(11).font(MONO).color(th::TEXT),
+        ]
+        .align_y(Alignment::Center),
+        gap(4.0),
+        slider(range, value as f32, move |v| on(v as u32))
+            .step(1.0_f32)
+            .style(th::slider),
+    ]
+    .into()
+}
+
+// ---------------------------------------------------------------- advanced
+
+// Every label here is the same word the CLI's `--help` uses, so a user who knows
+// one knows the other. The pick lists are ordered from "do the least" to "do the
+// most", not alphabetically.
+
+const HASH_OPTS: [&str; 2] = ["xxh64", "crc32c"];
+const INDEX_OPTS: [&str; 3] = ["off", "trust", "verify"];
+const SMALL_OPTS: [&str; 3] = ["auto", "kernel", "io"];
+const HUGE_OPTS: [&str; 3] = ["auto", "on", "off"];
+const DELTA_BLOCK_OPTS: [&str; 5] = ["auto", "1M", "4M", "16M", "64M"];
+const PREALLOC_OPTS: [&str; 4] = ["auto", "valid", "sparse", "off"];
+const COMPRESS_OPTS: [&str; 3] = ["off", "auto", "force"];
+const BACKEND_OPTS: [&str; 2] = ["native", "blocking"];
+const NUMA_OPTS: [&str; 3] = ["follow device", "off", "node"];
+const BUFFER_OPTS: [&str; 6] = ["256K", "1M", "2M", "4M", "8M", "16M"];
+const IO_PRIO_OPTS: [&str; 6] = ["default", "verylow", "low", "normal", "high", "critical"];
+const PROC_PRIO_OPTS: [&str; 7] = [
+    "default", "idle", "below", "normal", "above", "high", "realtime",
+];
+const THREAD_PRIO_OPTS: [&str; 8] = [
+    "default",
+    "idle",
+    "lowest",
+    "below",
+    "normal",
+    "above",
+    "highest",
+    "timecritical",
+];
+
+const fn hash_label(h: HashKind) -> &'static str {
+    match h {
+        | HashKind::Xxh64 => "xxh64",
+        | HashKind::Crc32c => "crc32c",
+    }
+}
+
+fn hash_from(s: &str) -> Message {
+    Message::HashPicked(match s {
+        | "crc32c" => HashKind::Crc32c,
+        | _ => HashKind::Xxh64,
+    })
+}
+
+const fn index_label(m: IndexMode) -> &'static str {
+    match m {
+        | IndexMode::Off => "off",
+        | IndexMode::Trust => "trust",
+        | IndexMode::Verify => "verify",
+    }
+}
+
+fn index_from(s: &str) -> Message {
+    Message::IndexPicked(match s {
+        | "trust" => IndexMode::Trust,
+        | "verify" => IndexMode::Verify,
+        | _ => IndexMode::Off,
+    })
+}
+
+const fn huge_label(h: HugeChoice) -> &'static str {
+    match h {
+        | HugeChoice::Auto => "auto",
+        | HugeChoice::On => "on",
+        | HugeChoice::Off => "off",
+    }
+}
+
+fn huge_from(s: &str) -> Message {
+    Message::HugePicked(match s {
+        | "on" => HugeChoice::On,
+        | "off" => HugeChoice::Off,
+        | _ => HugeChoice::Auto,
+    })
+}
+
+const fn small_label(m: SmallCopy) -> &'static str {
+    match m {
+        | SmallCopy::Auto => "auto",
+        | SmallCopy::Kernel => "kernel",
+        | SmallCopy::Io => "io",
+    }
+}
+
+fn small_from(s: &str) -> Message {
+    Message::SmallCopyPicked(match s {
+        | "kernel" => SmallCopy::Kernel,
+        | "io" => SmallCopy::Io,
+        | _ => SmallCopy::Auto,
+    })
+}
+
+const fn prealloc_label(m: PreallocMode) -> &'static str {
+    match m {
+        | PreallocMode::Auto => "auto",
+        | PreallocMode::Valid => "valid",
+        | PreallocMode::Sparse => "sparse",
+        | PreallocMode::Off => "off",
+    }
+}
+
+fn prealloc_from(s: &str) -> Message {
+    Message::PreallocPicked(match s {
+        | "valid" => PreallocMode::Valid,
+        | "sparse" => PreallocMode::Sparse,
+        | "off" => PreallocMode::Off,
+        | _ => PreallocMode::Auto,
+    })
+}
+
+const fn compress_label(m: CompressMode) -> &'static str {
+    match m {
+        | CompressMode::Off => "off",
+        | CompressMode::Auto => "auto",
+        | CompressMode::Force => "force",
+    }
+}
+
+fn compress_from(s: &str) -> Message {
+    Message::CompressPicked(match s {
+        | "auto" => CompressMode::Auto,
+        | "force" => CompressMode::Force,
+        | _ => CompressMode::Off,
+    })
+}
+
+const fn backend_label(k: ReactorKind) -> &'static str {
+    match k {
+        | ReactorKind::Native => "native",
+        | ReactorKind::Blocking => "blocking",
+    }
+}
+
+fn backend_from(s: &str) -> Message {
+    Message::BackendPicked(match s {
+        | "blocking" => ReactorKind::Blocking,
+        | _ => ReactorKind::Native,
+    })
+}
+
+const fn numa_label(n: NumaChoice) -> &'static str {
+    match n {
+        | NumaChoice::Auto => "follow device",
+        | NumaChoice::Off => "off",
+        | NumaChoice::Node => "node",
+    }
+}
+
+fn numa_from(s: &str) -> Message {
+    Message::NumaPicked(match s {
+        | "off" => NumaChoice::Off,
+        | "node" => NumaChoice::Node,
+        | _ => NumaChoice::Auto,
+    })
+}
+
+fn small_from_size(s: &str) -> Message {
+    Message::SmallThresholdPicked(s.to_string())
+}
+
+fn delta_block_from(s: &str) -> Message {
+    // "auto" is stored as empty, so `engine_config` leaves the block at its
+    // default and `normalize_with` derives it from the I/O unit.
+    Message::DeltaBlockPicked(if s == "auto" {
+        String::new()
+    } else {
+        s.to_string()
+    })
+}
+
+fn delta_min_from(s: &str) -> Message {
+    Message::DeltaMinPicked(s.to_string())
+}
+
+/// The I/O units a given buffer size can actually use.
+///
+/// `normalize_with` clamps `io_unit` to `buffer_size`, so offering a larger one
+/// would put a number on screen that the engine silently replaces.
+fn io_unit_opts(buffer: &str) -> Vec<&'static str> {
+    let limit = sirocco_core::human::parse_size(buffer).unwrap_or(1 << 20);
+    BUFFER_OPTS
+        .iter()
+        .copied()
+        .filter(|o| sirocco_core::human::parse_size(o).is_some_and(|v| v <= limit))
+        .collect()
+}
+
+fn buffer_from(s: &str) -> Message {
+    Message::BufferPicked(s.to_string())
+}
+
+fn io_unit_from(s: &str) -> Message {
+    Message::IoUnitPicked(s.to_string())
+}
+
+fn io_prio_from(s: &str) -> Message {
+    Message::IoPrioPicked(s.to_string())
+}
+
+fn proc_prio_from(s: &str) -> Message {
+    Message::ProcPrioPicked(s.to_string())
+}
+
+fn thread_prio_from(s: &str) -> Message {
+    Message::ThreadPrioPicked(s.to_string())
+}
+
+fn advanced_toggle(app: &App) -> Element<'_, Message> {
+    let label = if app.advanced {
+        "Hide advanced settings"
+    } else {
+        "Advanced settings"
+    };
+    button(centered(text(label).size(th::T_BODY)))
+        .width(Length::Fill)
+        .padding([8, 0])
+        .style(th::ghost)
+        .on_press(Message::ToggleAdvanced)
+        .into()
+}
+
+/// The I/O shape: what the engine asks the device for, and how.
+fn engine_group(app: &App) -> Element<'_, Message> {
+    column![
+        eyebrow("ENGINE"),
+        gap(8.0),
+        toggle_one(
+            app,
+            "Direct I/O — bypass the page cache",
+            app.direct,
+            Message::Direct
+        ),
+        gap(12.0),
+        choice("LARGE PAGES", &HUGE_OPTS, huge_label(app.huge), huge_from),
+        gap(6.0),
+        toggle_one(
+            app,
+            "Physical order per file (spinning disks)",
+            app.lcn,
+            Message::Lcn
+        ),
+        gap(6.0),
+        toggle_one(
+            app,
+            "Block delta and append-only updates",
+            app.delta,
+            Message::Delta
+        ),
+        gap(12.0),
+        choice(
+            "BACKEND",
+            &BACKEND_OPTS,
+            backend_label(app.backend),
+            backend_from
+        ),
+        gap(12.0),
+        choice(
+            "SMALL FILES",
+            &SMALL_OPTS,
+            small_label(app.small_copy),
+            small_from
+        ),
+        gap(12.0),
+        choice(
+            "PREALLOCATE",
+            &PREALLOC_OPTS,
+            prealloc_label(app.prealloc),
+            prealloc_from
+        ),
+        gap(12.0),
+        choice(
+            "COMPRESSION",
+            &COMPRESS_OPTS,
+            compress_label(app.compress),
+            compress_from
+        ),
+        gap(12.0),
+        choice("BUFFER", &BUFFER_OPTS, &app.buffer, buffer_from),
+        gap(12.0),
+        choice_owned(
+            "I/O UNIT",
+            io_unit_opts(&app.buffer),
+            &app.io_unit,
+            io_unit_from
+        ),
+    ]
+    .into()
+}
+
+/// Concurrency: how many requests are in flight, and how many threads make them.
+///
+/// Every count here has a "0 = let the engine decide" state, because the engine's
+/// own derivation is better than a number typed without knowing the machine.
+fn parallel_group(app: &App) -> Element<'_, Message> {
+    column![
+        eyebrow("CONCURRENCY"),
+        gap(8.0),
+        num_row(
+            "Overlap per thread",
+            1.0..=64.0,
+            app.overlap,
+            app.overlap.to_string(),
+            Message::Overlap
+        ),
+        gap(8.0),
+        num_row(
+            "Queue depth",
+            0.0..=512.0,
+            app.queue,
+            if app.queue == 0 {
+                "auto".into()
+            } else {
+                app.queue.to_string()
+            },
+            Message::Queue
+        ),
+        gap(8.0),
+        num_row(
+            "Scheduler threads",
+            0.0..=16.0,
+            app.feeders,
+            if app.feeders == 0 {
+                "adaptive".into()
+            } else {
+                app.feeders.to_string()
+            },
+            Message::Feeders
+        ),
+        gap(8.0),
+        num_row(
+            "Explicit readers",
+            0.0..=64.0,
+            app.readers,
+            if app.readers == 0 {
+                "from threads".into()
+            } else {
+                app.readers.to_string()
+            },
+            Message::Readers
+        ),
+        gap(8.0),
+        num_row(
+            "Explicit writers",
+            0.0..=64.0,
+            app.writers,
+            if app.writers == 0 {
+                "from threads".into()
+            } else {
+                app.writers.to_string()
+            },
+            Message::Writers
+        ),
+        gap(12.0),
+        eyebrow("SMALL-FILE TUNING"),
+        gap(8.0),
+        choice("SMALL THRESHOLD", &BUFFER_OPTS, &app.small, small_from_size),
+        gap(8.0),
+        num_row(
+            "Small batch",
+            1.0..=4096.0,
+            app.small_batch,
+            app.small_batch.to_string(),
+            Message::SmallBatch
+        ),
+    ]
+    .into()
+}
+
+/// The incremental-copy model: what it compares, how finely, and the measured
+/// rates it reasons with.
+fn delta_group(app: &App) -> Element<'_, Message> {
+    column![
+        eyebrow("DELTA"),
+        gap(8.0),
+        // "auto" follows the I/O unit, which is what the engine derives when the
+        // block is left alone. Without it, picking 1M while the card shows 8M was
+        // silently ignored.
+        choice(
+            "DELTA BLOCK",
+            &DELTA_BLOCK_OPTS,
+            app.delta_block_label(),
+            delta_block_from
+        ),
+        gap(4.0),
+        text(format!("using {}", app.effective_delta_block()))
+            .size(10)
+            .color(th::FAINT),
+        gap(12.0),
+        choice(
+            "DELTA MIN SIZE",
+            &BUFFER_OPTS,
+            &app.delta_min,
+            delta_min_from
+        ),
+        gap(8.0),
+        num_row(
+            "Probes per side",
+            1.0..=256.0,
+            app.probes,
+            app.probes.to_string(),
+            Message::Probes
+        ),
+        gap(8.0),
+        calibrate_row(app),
+    ]
+    .into()
+}
+
+/// The calibration button, its result, and why it exists.
+fn calibrate_row(app: &App) -> Element<'_, Message> {
+    let label = if app.calibrating {
+        "Measuring…"
+    } else {
+        "Measure throughput"
+    };
+    let button = button(centered(text(label).size(th::T_BODY)))
+        .width(Length::Fill)
+        .padding([7, 0])
+        .style(th::ghost);
+    let button = if app.calibrating || app.is_running() || app.dst.trim().is_empty() {
+        button
+    } else {
+        button.on_press(Message::Calibrate)
+    };
+    let note = if app.calibration.is_empty() {
+        "Feeds the delta cost model with measured rates. Without it the model assumes equal-speed media and rules delta out."
+            .to_string()
+    } else {
+        app.calibration.clone()
+    };
+    column![button, gap(5.0), text(note).size(10).color(th::FAINT),].into()
+}
+
+/// Where the work runs: which CPUs, which NUMA node, at what priority.
+fn scheduling_group(app: &App) -> Element<'_, Message> {
+    let mut col = column![
+        eyebrow("SCHEDULING"),
+        gap(8.0),
+        // A CPU list only takes effect through the affinity planner, so the
+        // engine pins whenever one is set. Showing `app.pin` alone would make the
+        // checkbox disagree with the config it produces.
+        toggle_one(
+            app,
+            if app.cpu_list.trim().is_empty() {
+                "Pin I/O threads to disjoint cores"
+            } else {
+                "Pin I/O threads to disjoint cores (implied by the CPU list)"
+            },
+            app.pin || !app.cpu_list.trim().is_empty(),
+            Message::Pin
+        ),
+        gap(10.0),
+        eyebrow("CPU LIST"),
+        gap(6.0),
+        input_or_static(
+            "0-3,8-11 — empty for every CPU",
+            &app.cpu_list,
+            Message::CpuList,
+            !app.is_running()
+        ),
+        gap(12.0),
+        choice("NUMA", &NUMA_OPTS, numa_label(app.numa), numa_from),
+    ];
+    if app.numa == NumaChoice::Node {
+        col = col.push(gap(10.0)).push(num_row(
+            "NUMA node",
+            0.0..=15.0,
+            app.numa_node,
+            app.numa_node.to_string(),
+            Message::NumaNode,
+        ));
+    }
+    col.push(gap(12.0))
+        .push(choice(
+            "I/O PRIORITY",
+            &IO_PRIO_OPTS,
+            &app.io_prio,
+            io_prio_from,
+        ))
+        .push(gap(12.0))
+        .push(choice(
+            "PROCESS PRIORITY",
+            &PROC_PRIO_OPTS,
+            &app.proc_prio,
+            proc_prio_from,
+        ))
+        .push(gap(12.0))
+        .push(choice(
+            "THREAD PRIORITY",
+            &THREAD_PRIO_OPTS,
+            &app.thread_prio,
+            thread_prio_from,
+        ))
+        .into()
+}
+
+/// What survives the copy besides the bytes.
+fn fidelity_group(app: &App) -> Element<'_, Message> {
+    column![
+        eyebrow("FIDELITY"),
+        gap(8.0),
+        toggle_one(
+            app,
+            "Copy permission bits and attributes",
+            app.perms,
+            Message::Perms
+        ),
+        gap(6.0),
+        toggle_one(app, "Copy extended attributes", app.xattrs, Message::Xattrs),
+        gap(6.0),
+        toggle_one(
+            app,
+            "Keep modification times",
+            app.keep_times,
+            Message::KeepTimes
+        ),
+        gap(12.0),
+        eyebrow("INDEX DIRECTORY"),
+        gap(6.0),
+        // A directory nothing writes to is a promise the run does not keep.
+        input_or_static(
+            if app.index == IndexMode::Off {
+                "unused while BLOCK INDEX is off"
+            } else {
+                "empty for the per-user cache"
+            },
+            &app.index_dir,
+            Message::IndexDir,
+            !app.is_running() && app.index != IndexMode::Off
+        ),
+    ]
+    .into()
+}
+
+/// What gets scanned, and what a symlink means.
+fn filters_group(app: &App) -> Element<'_, Message> {
+    column![
+        eyebrow("FILTERS"),
+        gap(8.0),
+        toggle_one(
+            app,
+            "Follow symbolic links",
+            app.follow_links,
+            Message::FollowLinks
+        ),
+        gap(6.0),
+        toggle_one(
+            app,
+            "Stay on the source filesystem",
+            app.one_fs,
+            Message::OneFs
+        ),
+        // The engine honours `delete_extra` only in Sync, where it is always on.
+        // A checkbox that cannot be turned off is worse than a sentence.
+        gap(6.0),
+        text(if app.mode == Mode::Sync {
+            "Mirror deletes destination files the source does not have."
+        } else {
+            "Extra files are only pruned in Mirror mode."
+        })
+        .size(10)
+        .color(th::FAINT),
+        gap(12.0),
+        eyebrow("EXCLUDE FILE"),
+        gap(6.0),
+        input_or_static(
+            "one glob per line, # for comments",
+            &app.exclude_from,
+            Message::ExcludeFrom,
+            !app.is_running()
+        ),
+        gap(10.0),
+        eyebrow("INCLUDE FILE"),
+        gap(6.0),
+        input_or_static(
+            "one glob per line, # for comments",
+            &app.include_from,
+            Message::IncludeFrom,
+            !app.is_running()
+        ),
+        gap(10.0),
+        num_row(
+            "Depth limit",
+            0.0..=64.0,
+            app.max_depth,
+            if app.max_depth == 0 {
+                "unlimited".into()
+            } else {
+                app.max_depth.to_string()
+            },
+            Message::MaxDepth
+        ),
+        gap(12.0),
+        eyebrow("FILE LIST"),
+        gap(6.0),
+        input_or_static(
+            "a file of paths, one per line",
+            &app.files_from,
+            Message::FilesFrom,
+            !app.is_running()
+        ),
+    ]
+    .into()
+}
+
+/// The privileged paths, and the switch that asks for them.
+fn privileges_group(app: &App) -> Element<'_, Message> {
+    column![
+        eyebrow("PRIVILEGES"),
+        gap(8.0),
+        toggle_one(
+            app,
+            "Request privileges before starting",
+            app.privileged,
+            Message::Privileged
+        ),
+        gap(6.0),
+        text(
+            "Volume management, page locking and backup semantics. Without them the \
+             engine falls back to the unprivileged paths, which are slower, not wrong."
+        )
+        .size(10)
+        .color(th::FAINT),
+    ]
+    .into()
+}
+
+fn threads_row(app: &App) -> Element<'_, Message> {
+    // While a job is running the row describes that job, not the form: the slider
+    // is live on purpose, and two thread counts on one screen with nothing saying
+    // which one is in force is worse than either.
+    let shown = if app.is_running() {
+        format!("running · {}+{}", app.last_readers, app.last_writers)
+    } else {
+        // The same pair the config gets, not the even split: with an explicit
+        // count on either side the split is not what runs.
+        let (r, w) = app.thread_pair();
+        if r == 0 && w == 0 {
+            let (sr, sw) = app.resolved_threads();
+            format!("auto · {sr}+{sw}")
+        } else {
+            format!("{r}+{w}")
+        }
     };
     column![
         row![
@@ -547,10 +1303,15 @@ fn content(app: &App) -> Element<'_, Message> {
         feed_card(app),
     ];
 
-    if let Some(sum) = &app.summary
-        && !sum.errors.is_empty()
-    {
-        col = col.push(gap(10.0)).push(error_list(sum));
+    if let Some(sum) = &app.summary {
+        if !sum.errors.is_empty() {
+            col = col.push(gap(10.0)).push(error_list(sum));
+        }
+    } else if let Some(err) = &app.error {
+        // A run that dies before producing a summary used to leave the whole
+        // right-hand side at zero with the only explanation under the Start
+        // button on the far left.
+        col = col.push(gap(10.0)).push(notice(err, th::ERR));
     }
 
     container(col)
@@ -583,7 +1344,10 @@ fn header(app: &App) -> Element<'_, Message> {
 
 fn error_list(sum: &sirocco_engine::session::Summary) -> Element<'_, Message> {
     let mut c = column![
-        text(format!("{} file(s) failed", sum.errors.len()))
+        // This counts error *lines*: a failed mkdir lands here without being a
+        // failed file, and a retried file can produce two lines. The FILES card
+        // owns the file count.
+        text(format!("{} error(s)", sum.errors.len()))
             .size(11)
             .color(th::ERR)
             .font(bold())
@@ -640,9 +1404,21 @@ fn stats_row(app: &App) -> Element<'_, Message> {
     let live = app.snap().or_else(|| app.summary.as_ref().map(|x| x.stats));
     let idle = live.is_none();
 
-    // The card and the chart must agree: both read the instantaneous rate, not
-    // the run average, or one says 120 and the other says 60 at the same moment.
-    let speed = f64::from(app.history.last().copied().unwrap_or(0.0));
+    // While running, the card and the chart must agree: both read the
+    // instantaneous rate. Once the run is over there is no "instantaneous" left,
+    // and the last 90 ms sample would freeze the biggest number on screen at
+    // whatever the final partial tick happened to catch.
+    let speed = if idle {
+        app.summary.as_ref().map_or(0.0, |s| {
+            if s.stats.elapsed_secs > 0.0 {
+                s.stats.bytes_accounted() as f64 / s.stats.elapsed_secs
+            } else {
+                0.0
+            }
+        })
+    } else {
+        f64::from(app.history.last().copied().unwrap_or(0.0))
+    };
 
     let (done, total, eta, elapsed) = if app.is_preview() {
         let sum = app.summary.as_ref().unwrap();
@@ -657,7 +1433,9 @@ fn stats_row(app: &App) -> Element<'_, Message> {
             || (0, 0, "--".into(), "--".into()),
             |s| {
                 (
-                    s.files_done + s.files_skipped,
+                    // Failed files are settled as well: leaving them out made the
+                    // card stop at "97 / 100" on a run that had finished.
+                    s.files_done + s.files_skipped + s.files_failed,
                     s.files_total,
                     // A remaining time on a finished job is a lie; the frozen
                     // summary keeps whatever it was at the last tick.
@@ -706,11 +1484,11 @@ fn progress_card(app: &App) -> Element<'_, Message> {
     let scanning = app.is_running() && s.is_none_or(|s| s.bytes_total == 0 && s.files_total == 0);
 
     let (pct, done, total, failed) = match &s {
-        | Some(s) if app.is_preview() => {
+        | Some(_) if app.is_preview() => {
             let sum = app.summary.as_ref().unwrap();
             (0.0, 0, sum.bytes_planned, 0)
         },
-        | Some(s) if scanning => (0.0, 0, 0, 0),
+        | Some(_) if scanning => (0.0, 0, 0, 0),
         // A mirror that finds everything already current writes no bytes, so the
         // byte ratio would read 0 % on a job that is completely finished. When
         // every planned file has been accounted for, that is 100 %.
@@ -723,7 +1501,9 @@ fn progress_card(app: &App) -> Element<'_, Message> {
         },
         | Some(s) => {
             (
-                s.progress() * 100.0,
+                // The files-only branch of `progress()` is not clamped, so a tree
+                // of zero-byte files could print 112.5 %.
+                (s.progress() * 100.0).clamp(0.0, 100.0),
                 s.bytes_accounted(),
                 s.bytes_total,
                 s.files_failed,
@@ -924,7 +1704,10 @@ fn meter_row(
 fn feed_card(app: &App) -> Element<'_, Message> {
     let mut list = column![];
 
-    if app.active.is_empty() && app.feed.is_empty() {
+    // "Nothing yet -- press Start" is onboarding text. After a run that copied
+    // nothing (an empty source, or everything filtered out) it reads as if the
+    // job never started.
+    if app.active.is_empty() && app.feed.is_empty() && app.phase == Phase::Idle {
         list = list.push(
             container(
                 column![

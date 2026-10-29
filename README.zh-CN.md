@@ -26,7 +26,8 @@ Windows 侧零第三方依赖，Linux 侧只有 `libc`。
 
 它不是 `std::fs::copy` 的封装。每一层都直接写在平台接口上 —— Windows 侧
 `CreateFileW` / `ReadFile` / `WriteFile` 走 IOCP，Linux 侧 `open(O_DIRECT)`
-加手写 `io_uring`。设计与每个默认值的推导见 **[DESIGN.md](DESIGN.md)**。
+加手写 `io_uring`。设计与每个默认值的推导见 **[DESIGN.zh-CN.md](DESIGN.zh-CN.md)**
+（[English](DESIGN.md)）。
 
 ```console
 $ sirocco copy D:\data E:\backup --verify=hash --pin
@@ -105,7 +106,7 @@ sirocco-gui
 每个文件的事件走一条 `mpsc`，同一次 tick 里排空。
 
 **刻意没有放进界面的**（CLI 仍然可用）：`--procs` 多进程切分、`delete` 模式、
-多源、NUMA / 亲和 / 缓冲区调优、压缩、扩展属性。理由在 DESIGN.md §13.12。
+多源、NUMA / 亲和 / 缓冲区调优、压缩、扩展属性。理由在 DESIGN.zh-CN.md §15.5。
 `Esc` 停止当前任务。
 
 ## 常用组合
@@ -216,7 +217,7 @@ python tests/e2e.py append # 只跑名字匹配的用例
 mtime、移动、删除、镜像、exclude、阻塞后端、无直接 I/O、稀疏源、物理顺序、
 不同缓冲区大小等组合。
 
-`cargo clippy --workspace --all-targets` 零告警，`cargo fmt --check` 是强制项。
+`cargo clippy --workspace --all-targets` 零告警，`cargo +nightly fmt --check` 是强制项。
 lint 规则刻意很严（`clippy::all`、`pedantic`、`nursery`、`missing_docs` 全部
 `deny`），每一处例外都写在 crate 根上并说明理由，见
 [CONTRIBUTING.md](CONTRIBUTING.md)。

@@ -1,0 +1,32 @@
+version: 2
+
+updates:
+  # `Cargo.lock` is committed and CI runs with `--locked`, so a dependency bump
+  # only reaches a build through a commit. One PR for all minor and patch bumps
+  # keeps that to a single review per week; a major bump gets its own, because it
+  # is the one that needs a human to read a changelog (iced 0.13 → 0.14 was six
+  # API changes and a rewritten entry point).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # Actions are pinned to major tags, so a new release is a real change to the
+  # build, not noise.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]

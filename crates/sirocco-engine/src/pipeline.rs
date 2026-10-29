@@ -86,6 +86,10 @@ pub struct Shared {
     /// its destination is in here — a size check is not enough, because the
     /// destination's size is established *before* any byte is written.
     pub completed: Mutex<std::collections::HashSet<std::path::PathBuf>>,
+    /// Destinations that will never be good. The hard-link path links later
+    /// siblings to the first copy, so it has to distinguish "not finished yet"
+    /// from "will never finish".
+    pub failed: Mutex<std::collections::HashSet<std::path::PathBuf>>,
 }
 
 impl Shared {
@@ -120,6 +124,7 @@ impl Shared {
             readers_alive: AtomicUsize::new(cfg.readers),
             writers_alive: AtomicUsize::new(cfg.writers),
             completed: Mutex::new(std::collections::HashSet::new()),
+            failed: Mutex::new(std::collections::HashSet::new()),
             topo,
             dst_root,
             journal,
@@ -167,28 +172,52 @@ impl Shared {
 
     /// Queue pre-read data for the writer stage (used by the delta and append
     /// paths, which produce buffers without going through the read queue).
+    /// Returns `false` when the message was dropped because the writers are gone.
+    ///
+    /// The caller has to settle the file's `pending` count in that case; the
+    /// buffer goes back to the pool either way, but a chunk nobody will write is
+    /// still a chunk the file is waiting for.
     pub fn push_ready(
         &self,
         r: Ready,
-    ) {
+    ) -> bool {
         let mut msg = WriteMsg::Ready(r);
         loop {
             match self.write_q.push(msg) {
-                | Ok(()) => return,
+                | Ok(()) => return true,
                 | Err(m) => {
                     msg = m;
                     if self.abort.load(Ordering::Relaxed)
                         || self.writers_alive.load(Ordering::Acquire) == 0
                     {
-                        // Dropping the message returns the buffer to the pool; the
-                        // file's pending count is settled by the caller's failure
-                        // path.
-                        return;
+                        return false;
                     }
                     std::thread::yield_now();
                 },
             }
         }
+    }
+
+    /// Record that a destination will never be good.
+    ///
+    /// The hard-link path links later siblings to the first copy, so it has to be
+    /// able to tell "not finished yet" from "will never finish".
+    pub fn mark_failed(
+        &self,
+        dst: &std::path::Path,
+    ) {
+        if let Ok(mut set) = self.failed.lock() {
+            set.insert(dst.to_path_buf());
+        }
+    }
+
+    /// True when this destination is known to have failed.
+    #[must_use]
+    pub fn is_failed(
+        &self,
+        dst: &std::path::Path,
+    ) -> bool {
+        self.failed.lock().is_ok_and(|s| s.contains(dst))
     }
 
     /// Record a destination as finished. Only `move` consumes this, but it is the
@@ -600,8 +629,15 @@ fn reader_main(
                 chunk: chunk.clone(),
                 buf,
             }) else {
-                shared.error("reader: out of operation slots".into());
-                break;
+                // Dropping the chunk would leave the file waiting for a block
+                // nobody will ever read. Fail it and settle the counter.
+                shared.error(format!(
+                    "reader: out of operation slots for {}",
+                    chunk.file.src.display()
+                ));
+                chunk.file.fail();
+                complete_file(shared.as_ref(), &chunk.file, &cache);
+                continue;
             };
             let op = unsafe { slab.get(op_idx) };
             let f = &cache.files[slot];
@@ -641,7 +677,15 @@ fn reader_main(
         let want = reactor.in_flight().min(cfg.overlap);
         if let Err(e) = reactor.poll(want, &mut comps) {
             shared.error(format!("reader poll: {e}"));
-            break;
+            // The ops still in `slab` reference buffers the device may still be
+            // reading into. Dropping them returns those buffers to the pool,
+            // where another file would take them and be corrupted. Give up on
+            // the whole reactor instead: cancel, then leak the slab and the
+            // handle cache so nothing is recycled while the kernel owns it.
+            reactor.cancel();
+            std::mem::forget(slab);
+            std::mem::forget(cache);
+            return;
         }
 
         // `comps` is a reusable batch buffer: draining is how it is emptied
@@ -698,12 +742,22 @@ fn reader_main(
             };
             let all_zero = cfg.sparse && is_zero(op.buf.slice(0, op.chunk.len as usize));
 
-            shared.push_ready(Ready {
-                chunk: op.chunk,
+            if !shared.push_ready(Ready {
+                chunk: op.chunk.clone(),
                 buf: op.buf,
                 hash,
                 all_zero,
-            });
+            }) {
+                // No writer will ever take this chunk. Fail the file and settle
+                // the op so the counter can reach zero.
+                shared.error(format!(
+                    "read {} @{}: writers stopped",
+                    op.chunk.file.src.display(),
+                    op.chunk.src_off
+                ));
+                op.chunk.file.fail();
+                complete_file(shared.as_ref(), &op.chunk.file, &cache);
+            }
         }
     }
 
@@ -717,8 +771,12 @@ fn reader_main(
                     | Err(m) => {
                         msg = m;
                         // On abort the writers are already leaving; blocking here
-                        // would hang the join.
-                        if shared.abort.load(Ordering::Relaxed) {
+                        // would hang the join. The same is true when every writer
+                        // has died for its own reasons: nobody will drain the
+                        // queue, so waiting for room in it is waiting forever.
+                        if shared.abort.load(Ordering::Relaxed)
+                            || shared.writers_alive.load(Ordering::Acquire) == 0
+                        {
                             return;
                         }
                         std::thread::yield_now();
@@ -753,7 +811,7 @@ fn writer_main(
     let mut slab: Slab<WOp> = Slab::with_capacity(cfg.overlap * 4 + 8);
     let mut comps: Vec<sirocco_sys::Completion> = Vec::with_capacity(cfg.overlap * 4);
     let mut shutting_down = false;
-    let verify = cfg.verify.reads_dest();
+    let verify_mode = cfg.verify;
 
     let mut cancelled = false;
     loop {
@@ -782,7 +840,10 @@ fn writer_main(
                     // The source does not allocate this range, so neither should
                     // the destination. One metadata call replaces a read and a
                     // write of the whole chunk.
-                    let k = key(c.file.id, K_DST);
+                    // The punch runs on a *buffered* handle, so it needs the
+                    // buffered key: sharing `K_DST` with the direct handle would
+                    // hand whichever opened first to the other path.
+                    let k = key(c.file.id, K_DST_BUF);
                     let mut opts = opts_dst(cfg, true);
                     opts.direct = false;
                     match cache.slot(reactor.as_mut(), k, &c.file.dst, &opts) {
@@ -834,7 +895,24 @@ fn writer_main(
                 // never has to open it.
                 opts.create = Create::Create;
             }
-            let slot = match cache.slot(reactor.as_mut(), k, &ready.chunk.file.dst, &opts) {
+            let dst = ready.chunk.file.dst.clone();
+            let opened = cache
+                .slot(reactor.as_mut(), k, &dst, &opts)
+                .or_else(|first| {
+                    // A directory where the source has a file blocks the copy,
+                    // and in mirror mode the destination is ours to correct.
+                    // Leaving it turns one mismatch into a permanent failure that
+                    // repeats on every run.
+                    if !(shared.cfg.mode == sirocco_core::plan::Mode::Sync
+                        && shared.cfg.delete_extra
+                        && dst.is_dir())
+                    {
+                        return Err(first);
+                    }
+                    std::fs::remove_dir_all(&dst)?;
+                    cache.slot(reactor.as_mut(), k, &dst, &opts)
+                });
+            let slot = match opened {
                 | Ok(s) => s,
                 | Err(e) => {
                     shared.fail(&ready.chunk.file, format!("open destination: {e}"));
@@ -923,7 +1001,12 @@ fn writer_main(
         let want = reactor.in_flight().min(cfg.overlap);
         if let Err(e) = reactor.poll(want, &mut comps) {
             shared.error(format!("writer poll: {e}"));
-            break;
+            // Same reasoning as the reader loop: a buffer still owned by the
+            // device must not go back to the pool.
+            reactor.cancel();
+            std::mem::forget(slab);
+            std::mem::forget(cache);
+            return;
         }
 
         // `comps` is a reusable batch buffer: draining is how it is emptied
@@ -973,7 +1056,7 @@ fn writer_main(
                         .fetch_add(w.ready.chunk.len, Ordering::Relaxed);
                     record_hash(&w.ready.chunk, w.hash);
 
-                    if !verify {
+                    if !verify_chunk(verify_mode, &w.ready.chunk) {
                         drop(w.ready.buf);
                         complete_file(shared.as_ref(), &w.ready.chunk.file, &cache);
                         continue;
@@ -986,6 +1069,9 @@ fn writer_main(
                     // Verification is a promise; block for the buffer instead of
                     // quietly downgrading to an unchecked write.
                     let Some(vbuf) = shared.pool.take(1 << 16) else {
+                        chunk
+                            .file
+                            .fail_with("verify: no buffer available".to_string());
                         shared.error(format!(
                             "verify: no buffer available for {}",
                             chunk.file.dst.display()
@@ -1143,18 +1229,31 @@ fn complete_file(
         return;
     }
     if file.failed.load(Ordering::Acquire) {
+        shared.mark_failed(&file.dst);
         shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
         if let Some(tx) = &shared.cfg.events {
-            let _ = tx.send(crate::config::Event::Failed {
+            tx.send(crate::config::Event::Failed {
                 rel: file.rel.clone(),
                 error: file.error().unwrap_or_else(|| "copy failed".to_string()),
             });
         }
         return;
     }
-    finalize(shared, file, cache);
+    if !finalize(shared, file, cache) {
+        // `finalize` already counted the failure and recorded why; what it must
+        // not do is let the listener hear `Done` for a file that is not finished.
+        if let Some(tx) = &shared.cfg.events {
+            tx.send(crate::config::Event::Failed {
+                rel: file.rel.clone(),
+                error: file
+                    .error()
+                    .unwrap_or_else(|| "finalize failed".to_string()),
+            });
+        }
+        return;
+    }
     if let Some(tx) = &shared.cfg.events {
-        let _ = tx.send(crate::config::Event::Done {
+        tx.send(crate::config::Event::Done {
             rel: file.rel.clone(),
             size: file.size,
             // Bytes that never had to be written (delta blocks that matched).
@@ -1165,19 +1264,47 @@ fn complete_file(
     }
 }
 
+/// Two timestamps are "the same" if they agree within the tolerance the skip
+/// decision uses: coarse filesystems only store whole seconds.
+fn within_two_seconds(
+    a: std::time::SystemTime,
+    b: std::time::SystemTime,
+) -> bool {
+    let tol = std::time::Duration::from_secs(2);
+    a.duration_since(b).map_or_else(
+        |_| b.duration_since(a).is_ok_and(|d| d <= tol),
+        |d| d <= tol,
+    )
+}
+
+/// Which chunks a verify mode actually re-reads.
+///
+/// `Sample` is a promise of three blocks -- head, middle, tail -- not a full
+/// pass. Treating it as a full pass made the cheap mode the expensive one.
+fn verify_chunk(
+    mode: VerifyMode,
+    c: &Chunk,
+) -> bool {
+    match mode {
+        | VerifyMode::Hash => true,
+        | VerifyMode::Sample => {
+            let mid = c.file.size / 2;
+            let end = c.src_off + c.len;
+            c.src_off == 0 || (c.src_off <= mid && end >= mid) || end >= c.file.size
+        },
+        // `size` and `size-mtime` are checked once, against the finished file.
+        | VerifyMode::None | VerifyMode::Size | VerifyMode::SizeMtime => false,
+    }
+}
+
 fn finalize(
     shared: &Shared,
     file: &FileCtx,
     cache: &HandleCache,
-) {
-    // `finalize` only runs for files that did not fail, so this is the point at
-    // which the destination is known good.
-    shared.mark_complete(&file.dst);
-    // The index and the journal describe the *file*, not a handle, so they are
-    // recorded even when there is nothing else left to do.
-    write_index(shared, file);
-    record_journal(shared, file);
-
+) -> bool {
+    // Nothing below may claim the file is good until every fallible step has
+    // run: `mark_complete` is what lets `Mode::Move` delete the source, and a
+    // destination left long by the padded tail is not a copy.
     let k = key(file.id, K_DST);
     let need_trunc = file.force_trunc || (!file.small && !file.size.is_multiple_of(shared.align));
     let need_touch = shared.cfg.keep_times && file.mtime.is_some();
@@ -1185,8 +1312,11 @@ fn finalize(
     let need_handle =
         need_trunc || need_touch || need_mode || shared.cfg.sync_at_end || file.clear_sparse_at_end;
     if !need_handle {
+        shared.mark_complete(&file.dst);
+        write_index(shared, file);
+        record_journal(shared, file);
         shared.stats.files_done.fetch_add(1, Ordering::Relaxed);
-        return;
+        return true;
     }
 
     // Prefer the handle we already hold; fall back to opening a fresh one.
@@ -1210,7 +1340,8 @@ fn finalize(
             | Err(e) => {
                 shared.error(format!("finalize {}: {e}", file.dst.display()));
                 shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
-                return;
+                file.fail();
+                return false;
             },
         }
     };
@@ -1218,37 +1349,90 @@ fn finalize(
     if need_trunc && let Err(e) = f.set_len(file.size) {
         shared.error(format!("truncate {}: {e}", file.dst.display()));
         shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
-        return;
+        file.fail();
+        return false;
     }
     if file.clear_sparse_at_end {
-        // Undo the hole-based reservation now that every byte is in place.
-        let _ = f.set_sparse_flag(false);
+        // Undo the hole-based reservation now that every byte is in place. A
+        // failure leaves the destination looking sparse to `du` and to backup
+        // tools, which is worth a line in the report but not a failed file.
+        if let Err(e) = f.set_sparse_flag(false) {
+            shared.error(format!("clear sparse {}: {e}", file.dst.display()));
+        }
     }
-    if shared.cfg.sync_at_end {
-        let _ = f.flush();
+    if shared.cfg.sync_at_end
+        && let Err(e) = f.flush()
+    {
+        shared.error(format!("flush {}: {e}", file.dst.display()));
     }
     if shared.cfg.preserve_acl {
         // Needs the source path, not just the handle: the security APIs take one.
-        if let Err(e) = sirocco_sys::copy_acl(&file.src, f)
-            && shared.cfg.verbose >= 2
-        {
+        // Best effort by design — a DACL that cannot be mapped across volumes is
+        // common and is why `--acl` is opt-in.
+        if let Err(e) = sirocco_sys::copy_acl(&file.src, f) {
             shared.error(format!("copy acl {}: {e}", file.dst.display()));
         }
     }
-    if need_mode
-        && let Err(e) = sirocco_sys::set_mode(f, file.mode)
-        && shared.cfg.verbose >= 2
-    {
+    if shared.cfg.preserve_xattrs {
+        // Unlike ACLs, `--xattrs` is an explicit request for the user's own
+        // attributes, so a failure is worth a line in the report. The engine
+        // already refused the option on a platform without them, once.
+        if let Err(e) = sirocco_sys::copy_xattrs(&file.src, f) {
+            shared.error(format!("copy xattrs {}: {e}", file.dst.display()));
+        }
+    }
+    if need_mode && let Err(e) = sirocco_sys::set_mode(f, file.mode) {
         shared.error(format!("set mode {}: {e}", file.dst.display()));
     }
+    // The timestamp is not decoration: the next run's skip decision is made
+    // against it, and `move` deletes the source once this file is complete. A
+    // destination with the wrong mtime is a wrong copy.
     if need_touch
         && let Some(t) = file.mtime
         && let Err(e) = f.set_modified(t)
-        && shared.cfg.verbose >= 2
     {
         shared.error(format!("set mtime {}: {e}", file.dst.display()));
+        shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
+        file.fail();
+        return false;
     }
+    // `size` and `size-mtime` verify nothing on the data path: neither mode reads
+    // the destination, and the pipeline compares nothing for them. Check the
+    // finished file instead -- last, after the timestamp is restored, or it would
+    // be comparing against "now".
+    if matches!(shared.cfg.verify, VerifyMode::Size | VerifyMode::SizeMtime) {
+        let verdict = std::fs::metadata(&file.dst).map(|md| {
+            let size_ok = md.len() == file.size;
+            let time_ok = shared.cfg.verify != VerifyMode::SizeMtime
+                || file
+                    .mtime
+                    .is_none_or(|t| md.modified().is_ok_and(|m| within_two_seconds(m, t)));
+            size_ok && time_ok
+        });
+        match verdict {
+            | Ok(true) => {},
+            | Ok(false) => {
+                shared.error(format!(
+                    "verify {}: destination does not match the source",
+                    file.dst.display()
+                ));
+                shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                file.fail();
+                return false;
+            },
+            | Err(e) => {
+                shared.error(format!("verify {}: {e}", file.dst.display()));
+                shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                file.fail();
+                return false;
+            },
+        }
+    }
+    shared.mark_complete(&file.dst);
+    write_index(shared, file);
+    record_journal(shared, file);
     shared.stats.files_done.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 /// Persist the block hashes collected while copying.
@@ -1287,7 +1471,7 @@ fn record_journal(
         .unwrap_or(&file.dst)
         .to_string_lossy()
         .replace('\\', "/");
-    j.record(&rel);
+    j.record(&rel, file.size, file.mtime_ns);
 }
 
 /// Finalize a file from outside a pipeline thread (used by the delta path).

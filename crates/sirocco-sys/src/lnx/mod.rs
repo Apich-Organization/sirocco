@@ -115,7 +115,7 @@ impl RawFile {
         opts: &OpenOpts,
     ) -> io::Result<Self> {
         let mut flags = match opts.access {
-            | Access::Read => libc::O_RDONLY,
+            | Access::Read | Access::Attributes => libc::O_RDONLY,
             | Access::Write => libc::O_WRONLY,
             | Access::ReadWrite => libc::O_RDWR,
         };
@@ -1450,19 +1450,10 @@ pub fn copy_file_fast(
             "copy_file_range stopped early",
         ));
     }
-    // `copy_file_range` moves data only: unlike `CopyFileExW` it carries neither
-    // the timestamps nor the permission bits, so put them back.
-    if let Ok(md) = std::fs::metadata(src) {
-        use std::os::unix::fs::MetadataExt;
-        let _ = set_mode(&wo, md.mode());
-        if let Ok(t) = md.modified() {
-            let _ = wo.set_modified(t);
-        }
-    }
-    // CopyFileExW carries the DACL over, so the Linux fast path carries the POSIX
-    // ACL over too; otherwise the same command would preserve permissions on one
-    // platform and silently drop them on the other.
-    let _ = copy_acl(src, &wo);
+    // Data only. `copy_file_range` carries neither timestamps, permission bits
+    // nor ACLs, and applying them here made `--no-preserve-times` and the absence
+    // of `--acl` unenforceable: the engine's own metadata pass is the single place
+    // that knows which of them the user asked for.
     Ok(())
 }
 
@@ -1594,6 +1585,15 @@ pub fn copy_acl(
     dst: &RawFile,
 ) -> io::Result<usize> {
     copy_xattrs_where(src, dst, Some("system.posix_acl_"))
+}
+
+/// Whether this platform can copy extended attributes.
+///
+/// The engine checks this once and refuses `--xattrs` up front on a platform
+/// where the answer is no, rather than reporting one error per file.
+#[must_use]
+pub const fn xattrs_supported() -> bool {
+    true
 }
 
 /// Copy every extended attribute from `src` to `dst`.

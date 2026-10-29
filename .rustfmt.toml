@@ -1,13 +1,16 @@
 # Line Style
 newline_style = "Unix"
 
-# Note: nine keys below are nightly-only — `blank_lines_upper_bound`,
-# `blank_lines_lower_bound`, `force_multiline_blocks`, `imports_layout`,
-# `imports_granularity`, `reorder_impl_items`, `struct_lit_single_line`,
-# `normalize_comments` and `format_code_in_doc_comments`. Stable `cargo fmt`
-# prints one warning per key and ignores it; the result is still deterministic,
-# just without the import reordering and the blank-line trimming. Run
-# `cargo +nightly fmt` to apply the full set before a release.
+# Formatting requires **nightly rustfmt**. Nine keys below are nightly-only —
+# `blank_lines_upper_bound`, `blank_lines_lower_bound`, `force_multiline_blocks`,
+# `imports_layout`, `imports_granularity`, `reorder_impl_items`,
+# `struct_lit_single_line`, `normalize_comments` and
+# `format_code_in_doc_comments` — and stable rustfmt silently ignores them, which
+# produces a different tree from the one CI accepts. Always:
+#
+#     cargo +nightly fmt --all
+#
+# The pre-commit hook and the `rustfmt` CI job both use nightly for this reason.
 
 # --- Visual Structure ---
 max_width = 100

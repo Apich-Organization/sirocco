@@ -27,7 +27,7 @@ out means `cargo build` and `cargo test` stay dependency-free on Linux (only
 ### What a full check looks like
 
 ```bash
-cargo fmt --all -- --check
+cargo +nightly fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test
 python tests/e2e.py
@@ -36,6 +36,31 @@ python tests/e2e.py
 The last one is not optional for a change that touches the copy path. It hashes
 the destination tree with Python's `hashlib` and compares it against the source,
 independently of anything the engine reports about itself.
+
+## What CI runs
+
+`.github/workflows/ci.yml` runs the same four commands on every push to `main`
+and every pull request, on both Windows and Linux, plus three jobs that are
+cheaper to let a machine do than to remember:
+
+| Job | What it proves |
+|---|---|
+| `rustfmt` | the tree is formatted with **nightly** rustfmt — `.rustfmt.toml` uses nine keys only nightly implements, so stable would format it differently and reject code nightly just produced |
+| `clippy` | no lint fires anywhere, including the GUI and the tests (`--all-targets`) |
+| `test` | unit tests, integration tests, and the end-to-end suite |
+| `rustdoc` | every intra-doc link resolves (`RUSTDOCFLAGS=-D warnings`) |
+| `MSRV` | the tree still builds on the `rust-version` in `Cargo.toml`, read from the manifest rather than repeated in the workflow |
+| `cargo-audit` | no advisory in the dependency tree — warnings such as "unmaintained" are reported but do not fail the build |
+
+A red `MSRV` job means one of two things: a dependency raised its own floor, or
+the code started using a newer feature. Either raise `rust-version` deliberately
+or pin the dependency that moved — do not let the job rot.
+
+Releases are cut by pushing a tag (`v0.1.0`); `.github/workflows/release.yml`
+re-runs the suite, builds the CLI and the GUI for Windows and Linux, and attaches
+the archives and their SHA-256 sums to the release. Dependabot opens one grouped
+PR a week for minor and patch bumps, and a separate one for a major bump, which
+is the one that needs a changelog read.
 
 ## Ground rules
 
@@ -108,9 +133,10 @@ keep `CreateFileW` spelled the way the header spells it.
 * Comments and doc comments are in English.
 * User-facing docs are split by language, one file each, linked from the top of
   the other: `README.md` is the English README and the one GitHub shows by
-  default; `README.zh-CN.md` is its Chinese translation. `DESIGN.md` is Chinese
-  only. A change to one README is a change to both — a stale translation is worse
-  than no translation.
+  default; `README.zh-CN.md` is its Chinese translation. The same split applies to
+  the design document: `DESIGN.md` is English, `DESIGN.zh-CN.md` is Chinese. A
+  change to one side is a change to both — a stale translation is worse than no
+  translation.
 * Every public item is documented — `missing_docs` is an error, not a suggestion.
 * A doc comment explains *why*, not *what*. `/// Opens the file.` on
   `fn open` is noise; `/// Opens without buffering so the read reaches the device

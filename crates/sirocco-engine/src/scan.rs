@@ -77,6 +77,34 @@ fn identity(
     }
 }
 
+/// Identity of a directory, for cycle detection.
+///
+/// An inode is unique within a filesystem, not across them, so the pair is the
+/// key: `--follow-symlinks` across a mount point used to prune a subtree whenever
+/// two volumes happened to hand out the same inode number.
+fn dir_key(
+    path: &Path,
+    md: &std::fs::Metadata,
+) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        (md.dev(), md.ino())
+    }
+    #[cfg(windows)]
+    {
+        let _ = md;
+        let (id, _) = sirocco_sys::file_identity(path).unwrap_or((0, 1));
+        (device_id(path), id)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, md);
+        (0, 0)
+    }
+}
+
 /// Volume identity, used by `--one-filesystem`.
 fn device_id(path: &Path) -> u64 {
     #[cfg(unix)]
@@ -115,6 +143,12 @@ struct WalkState {
     src_root: PathBuf,
     dst_root: PathBuf,
     root_dev: u64,
+    /// Directory identities already walked.
+    ///
+    /// Only used when following symlinks: without it a link that points at one of
+    /// its own ancestors makes the walk run forever. Empty otherwise, so the cost
+    /// is one `is_empty` check per directory.
+    seen_dirs: Mutex<std::collections::HashSet<(u64, u64)>>,
 }
 
 /// Build a plan from an explicit list of source-relative paths.
@@ -217,6 +251,16 @@ pub fn scan(
         return Ok(plan);
     }
 
+    // The root has to be in the set before the walk starts: a link pointing at
+    // the root otherwise passes the cycle check once and duplicates the whole
+    // top level under `<dst>/<link>/`.
+    let mut seen = std::collections::HashSet::new();
+    if cfg.follow_symlinks
+        && let Ok(md) = std::fs::metadata(src_root)
+    {
+        seen.insert(dir_key(src_root, &md));
+    }
+
     let state = Arc::new(WalkState {
         stack: Mutex::new(vec![(src_root.to_path_buf(), 0)]),
         active: AtomicUsize::new(1),
@@ -226,6 +270,7 @@ pub fn scan(
         src_root: src_root.to_path_buf(),
         dst_root: dst_root.to_path_buf(),
         root_dev,
+        seen_dirs: Mutex::new(seen),
     });
 
     let n = threads.clamp(1, 32);
@@ -314,6 +359,13 @@ fn read_dir_into(
             | Err(_) => continue,
         };
 
+        // `max_depth` counts levels below the root, so the root's own children
+        // are level 1. Gating only the descent let one extra level through, which
+        // made every `--max-depth=N` behave like `N+1`.
+        if rel.components().count() > st.cfg.max_depth {
+            continue;
+        }
+
         if !st.cfg.include.is_empty() && !pattern::any_match(&st.cfg.include, &rel) {
             // A directory may still contain matching files; only skip files.
             if !ft.is_dir() {
@@ -344,7 +396,10 @@ fn read_dir_into(
             continue;
         }
 
-        let kind = if ft.is_symlink() {
+        // With `--follow-symlinks` a link is whatever it points at: a linked
+        // directory has to be descended and a linked file has to be copied with
+        // its content. Deciding from `ft` first made the flag a no-op.
+        let kind = if ft.is_symlink() && !st.cfg.follow_symlinks {
             EntryKind::Symlink
         } else if md.is_dir() {
             EntryKind::Dir
@@ -379,8 +434,18 @@ fn read_dir_into(
             mode,
         });
 
-        if kind == EntryKind::Dir && depth < st.cfg.max_depth {
-            subdirs.push((path, depth + 1));
+        if kind == EntryKind::Dir && depth + 1 < st.cfg.max_depth {
+            // A followed link can point back at an ancestor. Remembering the
+            // directory identity is what stops the walk from looping.
+            let fresh = if st.cfg.follow_symlinks {
+                let id = dir_key(&path, &md);
+                st.seen_dirs.lock().is_ok_and(|mut s| s.insert(id))
+            } else {
+                true
+            };
+            if fresh {
+                subdirs.push((path, depth + 1));
+            }
         }
     }
 

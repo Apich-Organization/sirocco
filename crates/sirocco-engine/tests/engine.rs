@@ -580,3 +580,303 @@ fn capabilities_are_reported() {
         "unexpected tier {tier}"
     );
 }
+
+/// `move` over a tree that is already current must still remove the sources.
+///
+/// Only paths the pipeline reported as finished are deleted, and a skipped file
+/// never went through the pipeline — so the first version of this deleted nothing
+/// on a second run and left every source behind.
+#[test]
+fn move_removes_sources_that_were_already_current() {
+    let d = TempDir::new("move-skip");
+    let src = d.sub("src");
+    make_tree(&src);
+    let dst = d.sub("dst");
+
+    // Copy first, so the destination is already current when the move starts.
+    let first = copy(base_cfg(), &src, &dst);
+    assert_eq!(first.stats.files_failed, 0, "{:?}", first.errors);
+
+    let mut cfg = base_cfg();
+    cfg.mode = Mode::Move;
+    let second = copy(cfg, &src, &dst);
+    assert_eq!(second.stats.files_failed, 0, "{:?}", second.errors);
+    assert!(
+        second.stats.files_skipped > 0,
+        "expected a fully current tree"
+    );
+
+    // `digest` walks the tree; an empty map means every source is gone.
+    let leftovers = digest(&src);
+    assert!(leftovers.is_empty(), "sources left behind: {leftovers:?}");
+}
+
+/// A filtered mirror must not treat the filtered-out paths as extras.
+///
+/// `delete_extras` compares the destination with the plan, and the plan is
+/// already filtered: without a guard, `sync --exclude='*.tmp'` deletes every
+/// `.tmp` that was already in the destination.
+#[test]
+fn delete_extra_refuses_when_filters_are_active() {
+    let d = TempDir::new("delete-filtered");
+    let src = d.sub("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("keep.txt"), b"keep").unwrap();
+
+    let dst = d.sub("dst");
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(dst.join("keep.txt"), b"keep").unwrap();
+    std::fs::write(dst.join("stale.tmp"), b"scratch").unwrap();
+
+    let mut cfg = base_cfg();
+    cfg.mode = Mode::Sync;
+    cfg.scan.exclude.push("*.tmp".into());
+    let s = copy(cfg, &src, &dst);
+
+    assert!(
+        dst.join("stale.tmp").is_file(),
+        "an excluded path was deleted as if it were an extra"
+    );
+    assert_eq!(s.stats.files_failed, 0, "{:?}", s.errors);
+}
+
+/// `--follow-symlinks` has to descend into a linked directory.
+#[cfg(unix)]
+#[test]
+fn follow_symlinks_descends_linked_directories() {
+    let d = TempDir::new("follow");
+    let real = d.sub("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("inner.txt"), b"inner").unwrap();
+
+    let src = d.sub("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::os::unix::fs::symlink(&real, src.join("linked")).unwrap();
+
+    let dst = d.sub("dst");
+    let mut cfg = base_cfg();
+    cfg.scan.follow_symlinks = true;
+    let s = copy(cfg, &src, &dst);
+
+    assert_eq!(s.stats.files_failed, 0, "{:?}", s.errors);
+    assert!(
+        dst.join("linked/inner.txt").is_file(),
+        "the linked directory was not descended"
+    );
+}
+
+/// Every file the plan counted must end up in exactly one bucket.
+#[test]
+fn counters_account_for_every_planned_file() {
+    let d = TempDir::new("counters");
+    let src = d.sub("src");
+    make_tree(&src);
+    let dst = d.sub("dst");
+
+    let s = copy(base_cfg(), &src, &dst);
+    let settled = s.stats.files_done + s.stats.files_skipped + s.stats.files_failed;
+    assert_eq!(settled, s.files_planned, "errors: {:?}", s.errors);
+}
+
+/// `--dry-run` on a delete must not delete.
+///
+/// The delete branch used to be taken before the dry-run branch, so a preview of
+/// `rm` removed the tree for real.
+#[test]
+fn dry_run_delete_changes_nothing() {
+    let d = TempDir::new("dry-delete");
+    let src = d.sub("src");
+    make_tree(&src);
+    let before = digest(&src);
+
+    let mut cfg = base_cfg();
+    cfg.mode = Mode::Delete;
+    cfg.dry_run = true;
+    let s = copy(cfg, &src, &d.sub("dst"));
+
+    assert_eq!(s.stats.files_done, 0, "a preview reported deletions");
+    assert_eq!(digest(&src), before, "a preview deleted something");
+}
+
+/// `--max-depth` counts levels below the root, so N means N levels.
+///
+/// The old code only gated the descent, which let one extra level through and
+/// made every value behave like N+1.
+#[test]
+fn max_depth_counts_levels_below_the_root() {
+    let d = TempDir::new("depth");
+    let src = d.sub("src");
+    std::fs::create_dir_all(src.join("a/b")).unwrap();
+    std::fs::write(src.join("top.txt"), b"top").unwrap();
+    std::fs::write(src.join("a/mid.txt"), b"mid").unwrap();
+    std::fs::write(src.join("a/b/deep.txt"), b"deep").unwrap();
+
+    let dst = d.sub("dst");
+    let mut cfg = base_cfg();
+    cfg.scan.max_depth = 1;
+    let s = copy(cfg, &src, &dst);
+
+    assert_eq!(s.stats.files_failed, 0, "{:?}", s.errors);
+    assert!(dst.join("top.txt").is_file(), "level 1 was not copied");
+    assert!(
+        !dst.join("a/mid.txt").exists(),
+        "level 2 leaked through --max-depth=1"
+    );
+}
+
+/// A small file the kernel copied still has to keep its timestamp.
+///
+/// `copy_file_range` moves bytes and nothing else. `keep_times` defaults to on
+/// and the skip decision compares mtimes, so a destination without one is
+/// re-copied on every run and the incremental sync never converges.
+#[test]
+fn small_file_keeps_its_timestamp() {
+    let d = TempDir::new("small-mtime");
+    let src = d.sub("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let path = src.join("small.txt");
+    std::fs::write(&path, b"a small file").unwrap();
+
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+
+    let dst = d.sub("dst");
+    let s = copy(base_cfg(), &src, &dst);
+    assert_eq!(s.stats.files_failed, 0, "{:?}", s.errors);
+
+    let got = std::fs::metadata(dst.join("small.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let delta = got
+        .duration_since(when)
+        .or_else(|_| when.duration_since(got))
+        .unwrap();
+    assert!(
+        delta < std::time::Duration::from_secs(2),
+        "destination mtime is {delta:?} away from the source's"
+    );
+}
+
+/// A directory where the source has a file has to go whole.
+///
+/// Descending instead deleted the children one at a time and kept the directory,
+/// so the copy could never create the file and every run repeated the damage.
+#[test]
+fn delete_extra_removes_a_directory_that_blocks_a_file() {
+    let d = TempDir::new("delete-type");
+    let src = d.sub("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("thing"), b"file contents").unwrap();
+
+    let dst = d.sub("dst");
+    std::fs::create_dir_all(dst.join("thing")).unwrap();
+    std::fs::write(dst.join("thing/nested.txt"), b"stale").unwrap();
+
+    let mut cfg = base_cfg();
+    cfg.mode = Mode::Sync;
+    cfg.delete_extra = true;
+    let s = copy(cfg, &src, &dst);
+
+    assert_eq!(s.stats.files_failed, 0, "{:?}", s.errors);
+    assert!(
+        dst.join("thing").is_file(),
+        "the blocking directory survived the mirror"
+    );
+}
+
+/// A second `move` over an up-to-date hard-link group must not hang.
+///
+/// Both siblings are skipped, and a skipped file never enters the pipeline — so
+/// the second one waited for a `mark_complete` that could not arrive.
+#[test]
+fn move_over_a_current_hard_link_group_finishes() {
+    let d = TempDir::new("link-skip");
+    let src = d.sub("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.bin"), pattern(64 << 10, 7)).unwrap();
+    std::fs::hard_link(src.join("a.bin"), src.join("b.bin")).unwrap();
+
+    let dst = d.sub("dst");
+    let first = copy(base_cfg(), &src, &dst);
+    assert_eq!(first.stats.files_failed, 0, "{:?}", first.errors);
+
+    let mut cfg = base_cfg();
+    cfg.mode = Mode::Move;
+    let second = copy(cfg, &src, &dst);
+
+    assert_eq!(second.stats.files_failed, 0, "{:?}", second.errors);
+    assert!(
+        second.stats.files_skipped >= 2,
+        "expected both links to be current, got {} skipped / {} errors",
+        second.stats.files_skipped,
+        second.errors.len()
+    );
+}
+
+/// A small file copied with compression and preallocation on must still be the
+/// same length as its source.
+///
+/// The compression path reserves the destination to an alignment boundary instead
+/// of its exact size, so the truncate that removes the padded tail has to run for
+/// small files too.
+#[test]
+fn compressed_small_file_is_not_longer_than_its_source() {
+    let d = TempDir::new("compress-small");
+    let src = d.sub("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // Deliberately not a multiple of any plausible alignment.
+    let body = b"compressible text ".repeat(37);
+    std::fs::write(src.join("note.txt"), &body).unwrap();
+
+    let dst = d.sub("dst");
+    let mut cfg = base_cfg();
+    cfg.compress = sirocco_engine::config::CompressMode::Auto;
+    cfg.prealloc = PreallocMode::Auto;
+    let s = copy(cfg, &src, &dst);
+
+    assert_eq!(s.stats.files_failed, 0, "{:?}", s.errors);
+    let got = std::fs::metadata(dst.join("note.txt")).unwrap().len();
+    assert_eq!(got, body.len() as u64, "destination has a padded tail");
+}
+
+/// A read-only source has to survive the kernel fast path.
+///
+/// The destination inherits the source's mode, so reopening it to apply the
+/// metadata with a writable handle is refused — every small read-only file failed
+/// with EACCES while the destination was in fact correct.
+#[test]
+fn read_only_small_file_is_copied() {
+    let d = TempDir::new("readonly-small");
+    let src = d.sub("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let path = src.join("ro.txt");
+    std::fs::write(&path, b"read only").unwrap();
+
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    let dst = d.sub("dst");
+    let s = copy(base_cfg(), &src, &dst);
+    let copied = dst.join("ro.txt");
+
+    // Restore both before asserting: a failed assertion would otherwise leave a
+    // file the temporary-directory cleanup cannot remove on Windows.
+    for p in [&copied, &path] {
+        if let Ok(md) = std::fs::metadata(p) {
+            let mut perms = md.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(p, perms);
+        }
+    }
+
+    assert_eq!(s.stats.files_failed, 0, "{:?}", s.errors);
+    assert_eq!(std::fs::read(&copied).unwrap(), b"read only");
+}

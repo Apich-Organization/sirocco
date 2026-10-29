@@ -43,7 +43,7 @@ sirocco copy summary
 ```
 
 The design and the reasoning behind each default are in **[DESIGN.md](DESIGN.md)**
-(Chinese). This file is the practical one.
+(also available in [中文](DESIGN.zh-CN.md)). This file is the practical one.
 
 ## Quick start
 
@@ -139,7 +139,7 @@ events go over an `mpsc` channel and are drained in the same tick.
 multi-process splitting (it re-executes the binary with a manifest — batch
 territory), `delete` mode (a delete button in a GUI is a disaster waiting for a
 mis-click), multiple sources, NUMA / affinity / buffer tuning, compression, and
-extended attributes. The reasoning is in DESIGN.md §13.12.
+extended attributes. The reasoning is in DESIGN.md §15.5.
 
 `Esc` stops the current job.
 
@@ -275,8 +275,8 @@ content, text, 120 small files, appends, mid-file rewrites, mtime preservation,
 move, delete, mirror, excludes, the blocking backend, copies with direct I/O
 disabled, sparse sources, physical ordering and several buffer sizes.
 
-`cargo clippy --workspace --all-targets` is clean, and `cargo fmt --check` is
-enforced. The lint configuration is strict on purpose — `clippy::all`,
+`cargo clippy --workspace --all-targets` is clean, and `cargo +nightly fmt --check`
+is enforced. The lint configuration is strict on purpose — `clippy::all`,
 `pedantic`, `nursery` and `missing_docs` at `deny` — and every exception is
 written down at the crate root with the reason it exists. See
 [CONTRIBUTING.md](CONTRIBUTING.md).

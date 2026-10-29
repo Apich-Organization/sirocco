@@ -1,0 +1,170 @@
+name: CI
+
+# Every push to the default branch and every pull request. `workflow_dispatch` is
+# there so a flaky job can be re-run without pushing an empty commit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new commit makes the previous run's result irrelevant. Cancelling it frees
+# the (finite) Windows runners for the commit that matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Backtraces in a failing test are worth the noise; there is no other output.
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- formatting
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Nightly, because `.rustfmt.toml` uses nine keys only nightly rustfmt
+      # implements (`imports_granularity`, `normalize_comments`,
+      # `format_code_in_doc_comments`, ...). Stable prints one warning per key
+      # and ignores it, which formats the tree differently — so a stable run here
+      # would reject code that `cargo +nightly fmt --all` just produced.
+      #
+      # The toolchain floats with nightly. When a nightly change reformats the
+      # tree, run `cargo +nightly fmt --all` and commit the result on its own, so
+      # the churn does not hide inside someone's feature branch.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo +nightly fmt --all -- --check
+
+  # --------------------------------------------------------------------- lints
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy-${{ matrix.os }}
+      - name: Install GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev \
+            libgl1-mesa-dev
+      # `--workspace` reaches the GUI, which is deliberately not a default member
+      # (iced pulls in wgpu, winit, Wayland and X11); `--all-targets` adds the
+      # integration tests and the example. `--locked` keeps CI on the versions in
+      # Cargo.lock — a binary has no reason to float.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # --------------------------------------------------------------------- tests
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo test --workspace --locked
+      # The end-to-end suite re-hashes both trees with Python's hashlib and
+      # compares them, so it grades the tool from the outside. It drives
+      # `target/release/sirocco`, which means a release build, not a debug one.
+      - run: cargo build --release --locked
+      - run: python tests/e2e.py
+
+  # ----------------------------------------------------------------------- docs
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      - name: Install GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev \
+            libgl1-mesa-dev
+      # Broken intra-doc links are a documentation bug, and `missing_docs` already
+      # makes an undocumented public item a compile error.
+      - run: cargo doc --no-deps --workspace --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # ------------------------------------------------------------------------ msrv
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Read the floor from Cargo.toml instead of repeating the number here: one
+      # place to bump, one place that can be wrong.
+      - id: floor
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "sirocco-cli") | .rust_version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV from Cargo.toml: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.floor.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Install GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev \
+            libgl1-mesa-dev
+      # `check`, not `test`: this job answers "does the declared floor still
+      # build", and the full matrix already covers behaviour.
+      - run: cargo check --workspace --all-targets --locked
+
+  # ----------------------------------------------------------------------- audit
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # A copy engine reads untrusted files and writes them elsewhere; a
+      # vulnerable decoder in the tree is worth a red build.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Deliberately *not* `--deny warnings`: that also fails on "unmaintained",
+      # and the GUI stack pulls in several crates nobody here can replace. A real
+      # advisory still fails the job.
+      - run: cargo audit

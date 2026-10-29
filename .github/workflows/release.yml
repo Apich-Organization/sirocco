@@ -1,0 +1,162 @@
+name: Release
+
+# Tag-driven: `git tag v0.1.0 && git push --tags`. The manual trigger exists for
+# re-cutting a release whose artifacts were lost, and it demands the tag as an
+# input because a dispatch has no tag of its own.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # A tag is a promise that this exact tree passed. Re-running the suite here is
+  # cheaper than shipping a binary built from a commit that did not.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-verify
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+      - run: python tests/e2e.py
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxi-dev libxrandr-dev libxinerama-dev \
+            libgl1-mesa-dev
+      # Resolved in a step rather than at workflow level: `inputs` is only
+      # readable inside a `run`, and every later step needs the same answer.
+      - name: Resolve tag
+        run: echo "TAG=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+      # Both binaries: the CLI is the product, the GUI is the thing people
+      # actually double-click. `-p` is required because the GUI is not a default
+      # member of the workspace.
+      - name: Build
+        run: >
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p sirocco-cli -p sirocco-gui
+
+      # A release that cannot print its own version is not a release.
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/sirocco.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          "target/${{ matrix.target }}/release/sirocco" --version
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "sirocco-$env:TAG-${{ matrix.target }}"
+          $archive = "${name}.zip"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/sirocco.exe" $name
+          Copy-Item "target/${{ matrix.target }}/release/sirocco-gui.exe" $name
+          Copy-Item README.md, README.zh-CN.md, LICENSE.md, LICENSE-MIT.md, LICENSE-APACHE.md $name
+          Compress-Archive -Path $name -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "${hash}  ${archive}" | Out-File -Encoding ascii -NoNewline "${archive}.sha256"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="sirocco-${TAG}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/sirocco" "$name/"
+          cp "target/${{ matrix.target }}/release/sirocco-gui" "$name/"
+          cp README.md README.zh-CN.md LICENSE.md LICENSE-MIT.md LICENSE-APACHE.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            sirocco-*.zip
+            sirocco-*.tar.gz
+            sirocco-*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # `steps.*.outputs` is unambiguous where `env` is not, and an `rc` tag has
+      # to stay a pre-release even when the run was dispatched by hand.
+      - id: meta
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          case "$tag" in
+            *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Sirocco ${{ steps.meta.outputs.tag }}
+          files: dist/*
+          # The commit list and the diff link are written by GitHub from the tag,
+          # so the notes cannot drift from what was actually built.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ steps.meta.outputs.prerelease }}

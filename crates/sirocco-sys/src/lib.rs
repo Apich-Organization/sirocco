@@ -88,6 +88,7 @@ pub use plat::Topology;
 pub use plat::VolumeInfo;
 pub use plat::copy_acl;
 pub use plat::copy_file_fast;
+pub use plat::copy_xattrs;
 pub use plat::current_cpu;
 pub use plat::dio_alignment;
 pub use plat::file_identity;
@@ -103,6 +104,7 @@ pub use plat::set_process_priority;
 pub use plat::set_thread_mempolicy;
 pub use plat::set_thread_priority;
 pub use plat::volume_info;
+pub use plat::xattrs_supported;
 
 /// A single asynchronous I/O completion.
 #[derive(Clone, Copy, Debug)]
@@ -278,6 +280,13 @@ pub enum Access {
     Write,
     /// Both. Needed for `FSCTL_SET_COMPRESSION` and for read-back verification.
     ReadWrite,
+    /// Metadata only: enough to set timestamps, mode bits and (on Windows) the
+    /// security descriptor, and not enough to write data.
+    ///
+    /// A destination that was copied from a read-only source is read-only itself,
+    /// so `Write` cannot reopen it — which is exactly what the metadata pass after
+    /// a kernel-side copy has to do.
+    Attributes,
 }
 
 /// Creation / truncation semantics.

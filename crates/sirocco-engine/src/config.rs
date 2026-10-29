@@ -186,6 +186,39 @@ pub enum NumaMode {
     Node(u16),
 }
 
+/// Where per-file progress goes.
+///
+/// The CLI has no listener, so it leaves this `None`. A GUI wants one, and the
+/// difference between an unbounded channel and a bounded one matters there: a
+/// kernel-path copy of 200 000 small files produces events far faster than a
+/// window can draw them, and an unbounded queue turns that into a memory spike.
+/// `Bounded` drops the row instead, which costs a line in a list nobody can read
+/// at that rate and keeps the counters exact.
+#[derive(Debug, Clone)]
+pub enum EventSink {
+    /// Never blocks, never drops.
+    Unbounded(std::sync::mpsc::Sender<Event>),
+    /// Drops the event when the receiver has fallen behind.
+    Bounded(std::sync::mpsc::SyncSender<Event>),
+}
+
+impl EventSink {
+    /// Send, or drop. A listener that cannot keep up must not slow the copy.
+    pub fn send(
+        &self,
+        ev: Event,
+    ) {
+        match self {
+            | Self::Unbounded(tx) => {
+                let _ = tx.send(ev);
+            },
+            | Self::Bounded(tx) => {
+                let _ = tx.try_send(ev);
+            },
+        }
+    }
+}
+
 /// Everything that influences how the engine behaves.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -307,7 +340,7 @@ pub struct EngineConfig {
     /// Also write the summary to this file.
     pub log_file: Option<PathBuf>,
     /// Where per-file progress goes, if anyone is listening.
-    pub events: Option<std::sync::mpsc::Sender<Event>>,
+    pub events: Option<EventSink>,
 }
 
 impl Default for EngineConfig {
@@ -401,7 +434,9 @@ impl EngineConfig {
             self.readers = (cores / 2).max(1);
         }
         if self.writers == 0 {
-            self.writers = (cores - self.readers).max(1);
+            // `--readers=100` on an 8-core box used to underflow here: a panic in
+            // debug, a 64-writer config in release.
+            self.writers = cores.saturating_sub(self.readers).max(1);
         }
         self.readers = self.readers.clamp(1, 64);
         self.writers = self.writers.clamp(1, 64);
@@ -431,7 +466,18 @@ impl EngineConfig {
         // Comparison granularity must equal transfer granularity: the block
         // hashes stored in the persistent index are produced by the reader at
         // `io_unit` size, and the delta paths compare at the same size.
-        self.delta.block = self.io_unit;
+        // Only derive the granularity when the caller did not choose one:
+        // `--delta-block` used to be parsed and then unconditionally replaced.
+        //
+        // The persistent index is the exception: its entries are keyed by the
+        // granularity the *reader* hashes at, which is `io_unit`. A different
+        // `delta.block` would make every `write_index` call reject its own hash
+        // vector, so the index would silently never be written.
+        if self.delta.block == sirocco_core::delta::DeltaCfg::default().block
+            || self.index.enabled()
+        {
+            self.delta.block = self.io_unit;
+        }
     }
 
     /// Number of pooled buffers required so that no thread ever waits on the pool

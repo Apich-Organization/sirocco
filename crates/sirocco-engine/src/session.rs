@@ -74,6 +74,10 @@ pub struct Summary {
     pub backend: String,
     /// Direct-I/O alignment that was enforced.
     pub align: u64,
+    /// Reader threads the engine actually ran, after normalisation and clamping.
+    pub readers: usize,
+    /// Writer threads the engine actually ran.
+    pub writers: usize,
     /// Source volume, as `fs (root)`.
     pub volume_src: Option<String>,
     /// Destination volume, as `fs (root)`.
@@ -87,7 +91,7 @@ impl Summary {
     /// True when nothing failed and the run was not interrupted.
 
     pub const fn ok(&self) -> bool {
-        self.stats.files_failed == 0 && self.errors.is_empty()
+        self.stats.files_failed == 0 && self.errors.is_empty() && !self.interrupted
     }
 }
 
@@ -148,17 +152,6 @@ pub fn run_with(
         let _ = sirocco_sys::set_process_priority(p);
     }
 
-    // Copying a path onto itself would truncate the source before reading it.
-    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(&src), std::fs::canonicalize(&dst))
-        && a == b
-        && cfg.mode != Mode::Delete
-    {
-        return Err(Error::config(format!(
-            "source and destination are the same path: {}",
-            a.display()
-        )));
-    }
-
     // `cp -r` semantics: put the source directory *inside* an existing
     // destination instead of merging its contents. Done here rather than in each
     // caller so `--into` and the GUI toggle cannot drift apart.
@@ -173,6 +166,20 @@ pub fn run_with(
             std::fs::create_dir_all(&dst).map_err(|e| Error::io(&dst, "mkdir", e))?;
         }
         dst = dst.join(name);
+    }
+
+    // Copying a path onto itself would truncate the source before reading it.
+    // This runs *after* the `--into` remap: with `--into`, a destination that is
+    // the source's parent resolves to the source itself, and checking the
+    // un-remapped path would miss it.
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(&src), std::fs::canonicalize(&dst))
+        && a == b
+        && cfg.mode != Mode::Delete
+    {
+        return Err(Error::config(format!(
+            "source and destination are the same path: {}",
+            a.display()
+        )));
     }
 
     // --- capabilities ---------------------------------------------------
@@ -207,16 +214,33 @@ pub fn run_with(
     }
     let mut scan_cfg = cfg.scan.clone();
     scan_cfg.collect_links = cfg.preserve_links;
+    // `--follow-symlinks` in a destructive mode walks *through* links, so the
+    // entries carry paths outside the tree and the delete would remove them.
+    // Refusing the combination is the only safe answer.
+    if cfg.mode == Mode::Delete {
+        scan_cfg.follow_symlinks = false;
+    }
     let plan = if let Some(list) = &cfg.file_list {
         // A split worker copies exactly what its manifest says.
         scan::from_list(&src, &dst, list)?
     } else {
         scan::scan(&src, &dst, &scan_cfg, topo.logical_count())?
     };
+    // --- preview and delete short-circuit the pipeline ------------------
+    // The preview has to be decided first: `--dry-run` on a delete used to fall
+    // through to `run_delete`, which removed the tree for real.
+    if cfg.dry_run {
+        return Ok(run_dry(&cfg, &plan, align));
+    }
+    // Before the empty-plan return, so `rm emptydir` still removes the root.
+    if cfg.mode == Mode::Delete {
+        return Ok(run_delete(&cfg, plan, &src));
+    }
+
     if plan.entries.is_empty() {
         // An empty source tree is not an error: create the destination so the
         // result matches what `cp -r` would leave behind.
-        if src.is_dir() && cfg.mode != Mode::Delete && !cfg.dry_run {
+        if src.is_dir() {
             let _ = std::fs::create_dir_all(&dst);
         }
         if !cfg.quiet {
@@ -230,36 +254,48 @@ pub fn run_with(
             bytes_planned: 0,
             backend: native_backend_name(),
             align,
+            readers: 0,
+            writers: 0,
             volume_src: src_vol.map(|v| format!("{} ({})", v.fs, v.root.display())),
             volume_dst: dst_vol.map(|v| format!("{} ({})", v.fs, v.root.display())),
             interrupted: false,
         });
     }
 
-    // --- delete mode short-circuits the pipeline -----------------------
-    if cfg.mode == Mode::Delete {
-        return Ok(run_delete(&cfg, plan, &src));
-    }
-
-    if cfg.dry_run {
-        return Ok(run_dry(&cfg, &plan, align));
+    // `--xattrs` on a platform without them is a request that cannot be met.
+    // Saying so once beats 200 000 identical errors, and beats ignoring the flag.
+    let mut pre_errors: Vec<String> = Vec::new();
+    if cfg.preserve_xattrs && !sirocco_sys::xattrs_supported() {
+        cfg.preserve_xattrs = false;
+        pre_errors.push(
+            "extended attributes are not supported on this platform; --xattrs ignored".into(),
+        );
     }
 
     // --- engine --------------------------------------------------------
     sirocco_sys::interrupt::install().ok();
 
     // --- resume journal ------------------------------------------------
-    let mut already_done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut already_done: std::collections::HashMap<String, crate::journal::Entry> =
+        std::collections::HashMap::new();
     let mut journal: Option<Arc<Journal>> = None;
     if cfg.journal {
-        let jp = if dst.is_dir() {
+        // One rule, independent of whether the destination exists yet: the first
+        // run creates it, so a path that depended on existence would move between
+        // runs and the resume would never find the journal it wrote.
+        let jp = if dst.is_dir() || !dst.exists() {
             dst.join(crate::journal::JOURNAL_NAME)
         } else {
             dst.parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(crate::journal::JOURNAL_NAME)
         };
-        match Journal::open(jp) {
+        // The journal lives inside the destination, which may not exist on a
+        // first run; create it now rather than failing to open the journal.
+        if let Some(parent) = jp.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match Journal::open(jp, &src) {
             | Ok((j, done)) => {
                 already_done = done;
                 if !already_done.is_empty() && !cfg.quiet {
@@ -297,10 +333,14 @@ pub fn run_with(
     // Progress counters can live in a shared mapping, so a parent process sees
     // them without a pipe, a socket or a publisher thread. `shm_guard` keeps the
     // mapping alive for as long as the counters are in use.
-    let shm_guard = cfg
-        .shm
-        .as_ref()
-        .and_then(|p| sirocco_sys::shm::Shm::open(p).ok());
+    // A mapping shorter than the counter block would make every `fetch_add`
+    // write past the end of the segment, so the size is checked before the
+    // pointer is adopted rather than assumed.
+    let shm_guard = cfg.shm.as_ref().and_then(|p| {
+        sirocco_sys::shm::Shm::open(p)
+            .ok()
+            .filter(|m| m.len() >= std::mem::size_of::<sirocco_core::stats::Counters>())
+    });
     let stats = stats.unwrap_or_else(|| {
         Arc::new(shm_guard.as_ref().map_or_else(
             sirocco_core::stats::Stats::new,
@@ -330,6 +370,9 @@ pub fn run_with(
         .stats
         .bytes_total
         .store(plan.total_bytes, Ordering::Relaxed);
+    for e in pre_errors {
+        shared.error(e);
+    }
 
     // --- placement -------------------------------------------------------
     let placement = sirocco_sys::affinity::plan(
@@ -489,6 +532,10 @@ pub fn run_with(
                 };
                 loop {
                     if shared.abort.load(Ordering::Relaxed) {
+                        // Feeders park inside `acquire` waiting for a permit, and
+                        // only the "no entries left" branch below used to wake
+                        // them. Without this, Ctrl-C hangs the scope join.
+                        gate.stop();
                         break;
                     }
                     if !gate.acquire() {
@@ -514,9 +561,12 @@ pub fn run_with(
                                 let msg = err.to_string();
                                 shared.error(format!("{}: {msg}", e.src.display()));
                                 shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                                // A hard-linked sibling waits on this file; without
+                                // the flag it waits until the run ends.
+                                shared.mark_failed(&e.dst);
                                 // A listener gets the reason, not just a count.
                                 if let Some(tx) = &cfg_ref.events {
-                                    let _ = tx.send(crate::config::Event::Failed {
+                                    tx.send(crate::config::Event::Failed {
                                         rel: e.rel.clone(),
                                         error: msg,
                                     });
@@ -524,12 +574,13 @@ pub fn run_with(
                             }
                         },
                         | EntryKind::Symlink => {
-                            if let Err(err) = copy_symlink(e) {
+                            if let Err(err) = copy_symlink(e, cfg_ref) {
                                 let msg = err.to_string();
                                 shared.error(format!("{}: {msg}", e.src.display()));
                                 shared.stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                                shared.mark_failed(&e.dst);
                                 if let Some(tx) = &cfg_ref.events {
-                                    let _ = tx.send(crate::config::Event::Failed {
+                                    tx.send(crate::config::Event::Failed {
                                         rel: e.rel.clone(),
                                         error: msg,
                                     });
@@ -573,8 +624,17 @@ pub fn run_with(
             if !cfg.quiet {
                 eprintln!("sirocco: scan reported errors; skipping --delete-extra");
             }
-        } else {
+        } else if !filters_are_active(&cfg) {
             delete_extras(&dst, &plan, &shared, &cfg);
+        } else if !cfg.quiet {
+            // `keep` is the *filtered* plan, so anything the walk dropped looks
+            // like an extra. Deleting on that basis removes files the user asked
+            // to keep -- `--exclude='*.tmp'` would delete every `.tmp` already in
+            // the destination. Refuse rather than guess.
+            eprintln!(
+                "sirocco: --delete-extra is skipped while include/exclude/depth/filesystem \
+                 filters are active"
+            );
         }
     }
 
@@ -598,7 +658,14 @@ pub fn run_with(
     if let Some(j) = &journal {
         j.flush();
         let clean = shared.stats.files_failed.load(Ordering::Relaxed) == 0;
-        if clean {
+        // An interrupted run usually has zero failures, so the old condition
+        // deleted the journal exactly when it was needed. Keep it unless the run
+        // genuinely finished.
+        let finished = shared.stats.files_done.load(Ordering::Relaxed)
+            + shared.stats.files_skipped.load(Ordering::Relaxed)
+            >= plan.total_files;
+        let interrupted = sirocco_sys::interrupt::is_set();
+        if clean && finished && !interrupted {
             let p = j.path().to_path_buf();
             drop(journal.take());
             let _ = std::fs::remove_file(p);
@@ -606,7 +673,7 @@ pub fn run_with(
     }
 
     if let Some(tx) = &cfg.events {
-        let _ = tx.send(crate::config::Event::Finished {
+        tx.send(crate::config::Event::Finished {
             files: shared.stats.files_done.load(Ordering::Relaxed),
             failed: shared.stats.files_failed.load(Ordering::Relaxed),
         });
@@ -618,6 +685,17 @@ pub fn run_with(
     }
 
     let snap = shared.stats.snapshot();
+    // Nothing blocks on `pending` reaching zero, so a file whose work was
+    // abandoned used to disappear from every bucket while the summary still
+    // claimed success. Say so instead of leaving a hole in the arithmetic.
+    let accounted = snap.files_done + snap.files_skipped + snap.files_failed;
+    if accounted < plan.total_files {
+        shared.error(format!(
+            "{} of {} files were never accounted for (pipeline stopped early)",
+            plan.total_files - accounted,
+            plan.total_files
+        ));
+    }
     let errors = shared.errors.lock().unwrap().clone();
     let _ = t0;
 
@@ -633,6 +711,8 @@ pub fn run_with(
             "blocking".into()
         },
         align,
+        readers: cfg.readers,
+        writers: cfg.writers,
         volume_src: src_vol.map(|v| format!("{} ({})", v.fs, v.root.display())),
         volume_dst: dst_vol.map(|v| format!("{} ({})", v.fs, v.root.display())),
         interrupted,
@@ -665,7 +745,7 @@ struct Feeder<'a> {
     instant_alloc: bool,
     dst_root: PathBuf,
     /// Files already completed according to the resume journal.
-    done: &'a std::collections::HashSet<String>,
+    done: &'a std::collections::HashMap<String, crate::journal::Entry>,
     index: &'a IndexStore,
     /// Source and destination are on the same volume: a move is a rename.
     same_volume: bool,
@@ -694,7 +774,7 @@ impl Feeder<'_> {
     ) -> Result<()> {
         let ev = |ev: crate::config::Event| {
             if let Some(tx) = &self.cfg.events {
-                let _ = tx.send(ev);
+                tx.send(ev);
             }
         };
 
@@ -705,15 +785,27 @@ impl Feeder<'_> {
                 .unwrap_or(&e.dst)
                 .to_string_lossy()
                 .replace('\\', "/");
-            if self.done.contains(&rel) {
-                // Trust but verify: the journal only says a file was written last
-                // time. If it has since been deleted or truncated, copy it again.
-                let ok = std::fs::metadata(&e.dst).is_ok_and(|m| m.len() == e.size);
+            if let Some(&(size, mtime)) = self.done.get(&rel) {
+                // Trust but verify, twice over: the source has to be the one the
+                // entry was written for (a same-size edit would otherwise be
+                // skipped as "already copied"), and the destination still has to
+                // exist at that length.
+                let same_source = size == e.size && mtime == mtime_ns(e.mtime);
+                let ok = same_source && std::fs::metadata(&e.dst).is_ok_and(|m| m.len() == e.size);
                 if ok {
                     self.shared
                         .stats
                         .files_skipped
                         .fetch_add(1, Ordering::Relaxed);
+                    // A resumed file is settled exactly like a skipped one: it is in
+                    // the byte denominator, a hard-linked sibling may be waiting on
+                    // it, and `move` still has to delete the source.
+                    self.shared
+                        .stats
+                        .bytes_saved
+                        .fetch_add(e.size, Ordering::Relaxed);
+                    self.shared.mark_complete(&e.dst);
+                    ev(crate::config::Event::Skipped { rel: e.rel.clone() });
                     return Ok(());
                 }
             }
@@ -735,22 +827,33 @@ impl Feeder<'_> {
                 && first != e.dst
             {
                 let _ = self.ensure_parent(&e.dst);
-                // The sibling may still be in flight on another feeder; give it a
-                // moment before giving up and copying the data again.
-                let mut attempt = sirocco_sys::hard_link(&first, &e.dst);
-                for _ in 0..40 {
-                    if attempt.is_ok() || first.exists() {
-                        if attempt.is_ok() {
-                            break;
-                        }
-                        attempt = sirocco_sys::hard_link(&first, &e.dst);
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    attempt = sirocco_sys::hard_link(&first, &e.dst);
+                // Wait until the first copy is *finished*, not merely created: the
+                // destination is preallocated at full size before a byte is
+                // written, so `exists()` is true almost immediately and linking
+                // then would share a half-written inode. Waiting is safe — the
+                // other feeder holds its own permit and is pushing chunks, not
+                // waiting on this one — and it is the only way to tell "not yet"
+                // from "never".
+                // An abort has to break the wait: the first copy may be one of the
+                // files the interrupt stopped, and then it settles in neither set.
+                while !self.shared.is_complete(&first)
+                    && !self.shared.is_failed(&first)
+                    && !self.shared.abort.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
+                // A failed sibling has no data to share; fall through to copying
+                // this path's own bytes.
+                let attempt = if self.shared.is_complete(&first) {
+                    sirocco_sys::hard_link(&first, &e.dst)
+                } else {
+                    Err(std::io::Error::other("link target failed"))
+                };
                 match attempt {
                     | Ok(()) => {
+                        // The link *is* the copy, so the path is complete: `move`
+                        // needs to know that to remove the source.
+                        self.shared.mark_complete(&e.dst);
                         self.shared.stats.files_done.fetch_add(1, Ordering::Relaxed);
                         self.shared
                             .stats
@@ -821,15 +924,43 @@ impl Feeder<'_> {
                     .stats
                     .files_skipped
                     .fetch_add(1, Ordering::Relaxed);
+                // The file was in the plan, so it is in the progress denominator
+                // while nothing is written for it; without this the bar sits at
+                // 0 % and the ETA never terminates.
+                self.shared
+                    .stats
+                    .bytes_saved
+                    .fetch_add(e.size, Ordering::Relaxed);
+                // Marked complete in every mode, not just `move`: a hard-linked
+                // sibling waits for this flag before linking, and a skipped file
+                // never reaches the pipeline to set it. `mark_complete` is only
+                // *read* by `move`, so recording it elsewhere costs a hash insert.
+                self.shared.mark_complete(&e.dst);
                 ev(crate::config::Event::Skipped { rel: e.rel.clone() });
                 Ok(())
             },
             | Action::Full => {
                 // Small file with nothing else to do: let the filesystem copy it.
                 if self.kernel_copy_allowed(e) && self.ensure_parent(&e.dst).is_ok() {
-                    match sirocco_sys::copy_file_fast(&e.src, &e.dst) {
+                    match sirocco_sys::copy_file_fast(&e.src, &e.dst)
+                        .and_then(|()| self.finish_kernel_copy(e))
+                    {
                         | Ok(()) => {
                             self.shared.mark_complete(&e.dst);
+                            if let Some(j) = &self.shared.journal {
+                                // Same key shape and same payload the pipeline
+                                // records, or a resumed run would not recognise the
+                                // file it wrote.
+                                j.record(
+                                    &e.dst
+                                        .strip_prefix(&self.dst_root)
+                                        .unwrap_or(&e.dst)
+                                        .to_string_lossy()
+                                        .replace('\\', "/"),
+                                    e.size,
+                                    mtime_ns(e.mtime),
+                                );
+                            }
                             let st = &self.shared.stats;
                             st.files_done.fetch_add(1, Ordering::Relaxed);
                             st.bytes_written.fetch_add(e.size, Ordering::Relaxed);
@@ -941,6 +1072,14 @@ impl Feeder<'_> {
             return Action::Full;
         }
 
+        // A destination longer than the source would keep its old tail: the delta
+        // paths only rewrite blocks that differ and rely on a truncate that does
+        // not happen when the source size is a multiple of the alignment. Copy the
+        // whole file instead.
+        if dsize > e.size {
+            return Action::Full;
+        }
+
         // Same size: a block delta only wins when the destination is materially
         // slower than the source. If the break-even changed fraction is at or below
         // the safety margin it can never win, so skip the probe entirely — it costs
@@ -1021,7 +1160,12 @@ impl Feeder<'_> {
         let mut probes = 0u32;
         let mut bytes = 0u64;
         for off in offsets {
-            let len = unit.min(e.size - off) as usize;
+            // `unit` is clamped to 64 KiB but the pool buffer is `buffer_size`,
+            // which `--buffer=4K` makes smaller; slicing past it panics.
+            let len = (unit.min(e.size - off) as usize).min(a.len());
+            if len == 0 {
+                continue;
+            }
             let ra = src.pread(&mut a.as_mut_slice()[..len], off);
             let rb = dst.pread(&mut b.as_mut_slice()[..len], off);
             if let (Ok(na), Ok(nb)) = (ra, rb)
@@ -1143,7 +1287,19 @@ impl Feeder<'_> {
             io_priority: self.cfg.io_priority,
             ..Default::default()
         };
-        let f = RawFile::open(&e.dst, &opts).map_err(|x| Error::io(&e.dst, "create", x))?;
+        let f = match RawFile::open(&e.dst, &opts) {
+            | Ok(f) => f,
+            | Err(first) => {
+                // The same type mismatch the other way round: a directory where
+                // the source has a file. Descending into it would delete the
+                // children and leave the directory, so it goes whole.
+                if !(may_correct_dst(self.cfg) && e.dst.is_dir()) {
+                    return Err(Error::io(&e.dst, "create", first));
+                }
+                std::fs::remove_dir_all(&e.dst).map_err(|x| Error::io(&e.dst, "create", x))?;
+                RawFile::open(&e.dst, &opts).map_err(|x| Error::io(&e.dst, "create", x))?
+            },
+        };
         self.maybe_compress(e, &f);
         let clear_sparse = self.reserve(&f, e.size);
         if !self.cfg.prealloc.reserves() {
@@ -1151,6 +1307,53 @@ impl Feeder<'_> {
                 .map_err(|x| Error::io(&e.dst, "truncate", x))?;
         }
         Ok((clear_sparse, false))
+    }
+
+    /// Apply everything the pipeline would apply to a file the kernel copied.
+    ///
+    /// `copy_file_range` moves bytes and nothing else — no mode, no mtime, no
+    /// ACL, no extended attributes. `keep_times` defaults to on and the skip
+    /// decision compares mtimes, so leaving them behind made every small file
+    /// look stale on the next run: the incremental sync never converged.
+    fn finish_kernel_copy(
+        &self,
+        e: &Entry,
+    ) -> std::io::Result<()> {
+        // `Attributes`, not `Write`: a read-only source produces a read-only
+        // destination, and `GENERIC_WRITE` / `O_WRONLY` on it is refused. The
+        // attribute handle is enough for everything below.
+        let f = RawFile::open(
+            &e.dst,
+            &OpenOpts {
+                access: Access::Attributes,
+                create: Create::Open,
+                ..OpenOpts::default()
+            },
+        )?;
+        if self.cfg.preserve_permissions && e.mode != 0 {
+            sirocco_sys::set_mode(&f, e.mode)?;
+        }
+        if self.cfg.keep_times {
+            if let Some(t) = e.mtime {
+                f.set_modified(t)?;
+            }
+        } else {
+            // `--no-preserve-times`: `CopyFileExW` carries the source's timestamp
+            // across, so it has to be replaced explicitly rather than ignored.
+            f.set_modified(std::time::SystemTime::now())?;
+        }
+        // `--verify=size` is allowed on this path, so it has to be checked here:
+        // `finalize` never runs for a kernel copy.
+        if self.cfg.verify == VerifyMode::Size {
+            let got = std::fs::metadata(&e.dst)?.len();
+            if got != e.size {
+                return Err(std::io::Error::other(format!(
+                    "verify: destination is {got} bytes, source is {}",
+                    e.size
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Is a kernel-side copy acceptable for this file?
@@ -1165,19 +1368,25 @@ impl Feeder<'_> {
         if self.cfg.small_copy == SmallCopy::Io {
             return false;
         }
-        if self.cfg.small_copy == SmallCopy::Auto {
-            let plain_verify = matches!(
-                self.cfg.verify,
-                sirocco_core::plan::VerifyMode::None | sirocco_core::plan::VerifyMode::Size
-            );
-            if !plain_verify
-                || self.cfg.compress != CompressMode::Off
-                || self.cfg.sparse
-                || self.index.enabled()
-                || self.cfg.preserve_acl
-            {
-                return false;
-            }
+        // The kernel path never sees the bytes, so anything that needs to see
+        // them rules it out -- for `kernel` as much as for `auto`. Forcing the
+        // mode used to skip these checks and silently drop verification.
+        let plain_verify = matches!(
+            self.cfg.verify,
+            sirocco_core::plan::VerifyMode::None | sirocco_core::plan::VerifyMode::Size
+        );
+        // `verify=size` stays allowed: `finish_kernel_copy` checks it there.
+        if !plain_verify
+            || self.cfg.compress != CompressMode::Off
+            || self.cfg.sparse
+            || self.index.enabled()
+            || self.cfg.preserve_acl
+            || self.cfg.preserve_xattrs
+            // `--sync` needs a writable handle to flush through, and the kernel
+            // copy closes its own before we get here.
+            || self.cfg.sync_at_end
+        {
+            return false;
         }
         e.size <= self.cfg.small_threshold
     }
@@ -1194,7 +1403,16 @@ impl Feeder<'_> {
         if parent.as_os_str().is_empty() || self.last_dir.as_deref() == Some(parent) {
             return Ok(());
         }
-        std::fs::create_dir_all(parent)?;
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            // A file sitting where the destination needs a directory blocks the
+            // copy and would block it again on every mirror run. `delete_extra`
+            // is what says the destination is ours to correct.
+            if !(may_correct_dst(self.cfg) && parent.is_file()) {
+                return Err(e);
+            }
+            std::fs::remove_file(parent)?;
+            std::fs::create_dir_all(parent)?;
+        }
         self.last_dir = Some(parent.to_path_buf());
         Ok(())
     }
@@ -1361,7 +1579,12 @@ impl Feeder<'_> {
         ctx.clear_sparse_at_end = clear_sparse && !punched;
         ctx.mtime_ns = mtime_ns(e.mtime);
         ctx.mode = e.mode;
-        ctx.small = small;
+        // `FileCtx::small` means "no reservation was made, so there is no padded
+        // tail to cut". Compression takes the long path even for a small file, so
+        // the destination was reserved to an alignment boundary and the tail is
+        // real; forwarding `small` there left it in place and the destination came
+        // out longer than its source.
+        ctx.small = small && self.cfg.compress == CompressMode::Off;
         // An index file per tiny file would cost more inodes than it saves in
         // I/O, and below the delta threshold the decision is always a full copy.
         if self.index.enabled() && e.size >= self.cfg.delta.min_size {
@@ -1379,13 +1602,16 @@ impl Feeder<'_> {
                 create: Create::Create,
                 ..Default::default()
             };
-            if let Ok(f) = RawFile::open(&e.dst, &opts) {
-                let _ = f.set_len(0);
-                if self.cfg.keep_times
-                    && let Some(t) = e.mtime
-                {
-                    let _ = f.set_modified(t);
-                }
+            // An empty file still has to exist. Failing here is a failure: the
+            // old code marked the path complete regardless, and `move` then
+            // deleted the only copy.
+            let f = RawFile::open(&e.dst, &opts).map_err(|x| Error::io(&e.dst, "create", x))?;
+            f.set_len(0).map_err(|x| Error::io(&e.dst, "truncate", x))?;
+            if self.cfg.keep_times
+                && let Some(t) = e.mtime
+            {
+                f.set_modified(t)
+                    .map_err(|x| Error::io(&e.dst, "mtime", x))?;
             }
             self.shared.mark_complete(&e.dst);
             self.shared.stats.files_done.fetch_add(1, Ordering::Relaxed);
@@ -1525,6 +1751,10 @@ impl Feeder<'_> {
         ctx.sparse = self.cfg.sparse;
         ctx.clear_sparse_at_end = clear_sparse;
         ctx.mtime_ns = mtime_ns(e.mtime);
+        // Without this the append and delta paths write a destination whose
+        // `need_mode` is false, so an incremental sync silently drops the
+        // executable bit that the full path preserves.
+        ctx.mode = e.mode;
         if self.index.enabled() {
             // The blocks before `start` keep their old hashes, which the index
             // already holds; only the rewritten tail needs recording, but a
@@ -1591,6 +1821,14 @@ impl Feeder<'_> {
             e.mtime,
         );
         ctx.mtime_ns = mtime_ns(e.mtime);
+        // Same reason as the append path: mode is part of the contract.
+        ctx.mode = e.mode;
+        // And the index needs the block hashes, or `--index` degrades to a full
+        // copy for exactly the files that change most.
+        if self.index.enabled() && e.size >= self.cfg.delta.min_size {
+            let blocks = e.size.div_ceil(self.cfg.delta.block.max(1)) as usize;
+            ctx.hashes = Some(std::sync::Mutex::new(vec![0u64; blocks]));
+        }
         // Start from the recorded hashes and update the entries we rewrite, so the
         // index written at the end reflects the new content without a second pass.
         ctx.hashes = Some(std::sync::Mutex::new(idx.hashes.clone()));
@@ -1625,21 +1863,29 @@ impl Feeder<'_> {
             let off = i * block;
             let len = block.min(e.size - off) as usize;
             if src.pread(&mut sbuf.as_mut_slice()[..len], off).unwrap_or(0) != len {
-                return Err(Error::io(
-                    &e.src,
-                    "read",
-                    std::io::Error::other("short read"),
-                ));
+                // `pending` is already published, so returning `Err` here would
+                // leave the file permanently unfinished. Settle the blocks that
+                // will never be queued and let the failure path run.
+                self.abandon(&ctx, n_blocks - i, "short read during indexed delta");
+                return Ok(());
             }
             let sh = self.cfg.hash.hash(sbuf.slice(0, len));
             let mut same = sh == idx.hashes[i as usize];
             if same && let (Some(dst), Some(db)) = (dst.as_ref(), dbuf.as_mut()) {
                 same = match dst.pread(&mut db.as_mut_slice()[..len], off) {
-                    | Ok(n) if n == len => xxh64(db.slice(0, len)) == idx.hashes[i as usize],
+                    | Ok(n) if n == len => {
+                        self.cfg.hash.hash(db.slice(0, len)) == idx.hashes[i as usize]
+                    },
                     | _ => false,
                 };
             }
             if same {
+                // Nothing is written for this block, so it is both "done" and
+                // "saved": the progress denominator and the ETA depend on it.
+                self.shared
+                    .stats
+                    .bytes_saved
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 crate::pipeline::complete_external(&self.shared, &ctx);
                 continue;
             }
@@ -1652,13 +1898,11 @@ impl Feeder<'_> {
                 *slot = sh;
             }
             let all_zero = self.cfg.sparse && crate::pipeline::is_zero_pub(sbuf.slice(0, len));
-            let buf = std::mem::replace(
-                &mut sbuf,
-                self.shared
-                    .pool
-                    .take(4096)
-                    .ok_or_else(|| Error::other("no buffer for indexed delta"))?,
-            );
+            let Some(fresh) = self.shared.pool.take(4096) else {
+                self.abandon(&ctx, n_blocks - i, "no buffer for indexed delta");
+                return Ok(());
+            };
+            let buf = std::mem::replace(&mut sbuf, fresh);
             let mut chunk = Chunk::new(ctx.clone(), off, off, len as u64, self.align);
             chunk.block = i as u32;
             self.shared.push_ready(Ready {
@@ -1677,6 +1921,34 @@ impl Feeder<'_> {
             );
         }
         Ok(())
+    }
+
+    /// Give up on a file whose remaining blocks will never be queued.
+    ///
+    /// `pending` was published for the whole file up front, so every block that is
+    /// never pushed has to be settled here. Without this the counter never reaches
+    /// zero and the file is neither finished nor failed -- no truncate, no mtime,
+    /// no index, and a summary that does not add up.
+    fn abandon(
+        &self,
+        ctx: &Arc<FileCtx>,
+        remaining: u64,
+        why: &str,
+    ) {
+        ctx.fail_with(why.to_string());
+        self.shared.error(format!("{}: {why}", ctx.dst.display()));
+        if remaining == 0 {
+            return;
+        }
+        // `complete_file` is the only thing that puts a file in a bucket, and it
+        // only runs on the transition to zero. Subtracting the whole remainder
+        // drove the count to zero with nothing left to settle it, so the file
+        // vanished from `done + skipped + failed` entirely.
+        let extra = remaining.saturating_sub(1).min(u64::from(u32::MAX)) as u32;
+        if extra > 0 {
+            ctx.pending.fetch_sub(extra, Ordering::AcqRel);
+        }
+        crate::pipeline::complete_external(&self.shared, ctx);
     }
 
     /// Block-level delta: read both sides block by block, queue the differing
@@ -1706,6 +1978,7 @@ impl Feeder<'_> {
         );
         ctx.sparse = self.cfg.sparse;
         ctx.clear_sparse_at_end = clear_sparse;
+        ctx.mode = e.mode;
         let ctx = Arc::new(ctx);
 
         let block = self.cfg.delta.block.max(self.align);
@@ -1744,7 +2017,12 @@ impl Feeder<'_> {
             };
             if same {
                 // Unchanged block: nothing to write, but the file may still be
-                // complete after this one.
+                // complete after this one. The bytes count as saved, or progress
+                // and the ETA would describe a full copy.
+                self.shared
+                    .stats
+                    .bytes_saved
+                    .fetch_add(len as u64, Ordering::Relaxed);
                 crate::pipeline::complete_external(&self.shared, &ctx);
                 continue;
             }
@@ -1756,21 +2034,23 @@ impl Feeder<'_> {
             };
             let all_zero = self.cfg.sparse && crate::pipeline::is_zero_pub(a.slice(0, len));
             // Hand `a` to the writer and take a fresh buffer for the next block.
-            let buf: Buf = std::mem::replace(
-                &mut a,
-                self.shared
-                    .pool
-                    .take(4096)
-                    .ok_or_else(|| Error::other("no buffer for delta"))?,
-            );
+            let Some(fresh) = self.shared.pool.take(4096) else {
+                self.abandon(&ctx, n_blocks - i, "no buffer for delta");
+                break;
+            };
+            let buf: Buf = std::mem::replace(&mut a, fresh);
             let mut chunk = Chunk::new(ctx.clone(), off, off, len as u64, self.align);
             chunk.block = i as u32;
-            self.shared.push_ready(Ready {
+            if !self.shared.push_ready(Ready {
                 chunk,
                 buf,
                 hash,
                 all_zero,
-            });
+            }) {
+                // The writers are gone; nothing after this block can be written.
+                self.abandon(&ctx, n_blocks - i, "writers stopped during delta");
+                break;
+            }
         }
         let _ = written;
         Ok(())
@@ -1893,36 +2173,97 @@ fn content_equal(
     Some(true)
 }
 
-fn copy_symlink(e: &Entry) -> std::io::Result<()> {
+fn copy_symlink(
+    e: &Entry,
+    cfg: &EngineConfig,
+) -> std::io::Result<()> {
     let target = std::fs::read_link(&e.src)?;
     if let Some(p) = e.dst.parent() {
         let _ = std::fs::create_dir_all(p);
     }
-    let _ = std::fs::remove_file(&e.dst);
+    // A real directory cannot be replaced with `remove_file`, so the link was
+    // never created and the error was discarded: `sync` failed on that path every
+    // run without ever converging.
+    match std::fs::symlink_metadata(&e.dst) {
+        | Ok(md) if md.is_dir() => {
+            if !may_correct_dst(cfg) {
+                return Err(std::io::Error::other(
+                    "a directory is in the way of the symbolic link",
+                ));
+            }
+            std::fs::remove_dir_all(&e.dst)?;
+        },
+        | Ok(_) => std::fs::remove_file(&e.dst)?,
+        | Err(_) => {},
+    }
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&target, &e.dst)?;
     }
     #[cfg(windows)]
     {
+        // Unlike Unix, creating a symlink on Windows needs Developer Mode or
+        // SeCreateSymbolicLinkPrivilege. Ignoring the error made every link
+        // silently absent while the run reported zero failures.
         if target.is_dir() {
-            let _ = std::os::windows::fs::symlink_dir(&target, &e.dst);
+            std::os::windows::fs::symlink_dir(&target, &e.dst)?;
         } else {
-            let _ = std::os::windows::fs::symlink_file(&target, &e.dst);
+            std::os::windows::fs::symlink_file(&target, &e.dst)?;
         }
     }
     Ok(())
 }
 
+/// True when the scan dropped paths the destination walk would not see.
+///
+/// `delete_extras` compares the destination against the plan, and the plan is
+/// already filtered: a path the filters removed is indistinguishable from a path
+/// the source does not have.
+/// May the engine correct the destination when a copy is blocked?
+///
+/// Only in mirror mode: that is the one mode where the destination is declared
+/// to be a copy of the source, and `delete_extras` already applies the same rule
+/// (plus the filter checks) to the sweep at the end of the run. `cp --delete-extra`
+/// used to reach these paths too, which turned one type mismatch into a
+/// `remove_dir_all` in a mode that promises not to delete anything.
+const fn may_correct_dst(cfg: &EngineConfig) -> bool {
+    matches!(cfg.mode, Mode::Sync) && cfg.delete_extra
+}
+
+const fn filters_are_active(cfg: &EngineConfig) -> bool {
+    !cfg.scan.include.is_empty()
+        || !cfg.scan.exclude.is_empty()
+        || cfg.scan.one_filesystem
+        || cfg.scan.max_depth != usize::MAX
+        || cfg.file_list.is_some()
+}
+
+/// Remove destination paths the source does not have.
+///
+/// Two things this has to get right beyond "delete what is not in the plan":
+///
+/// 1. A type mismatch. When the source has a file where the destination has a
+///    directory, descending deletes the children one at a time and leaves the
+///    directory itself — which the plan keeps, so the copy can never create the
+///    file and the next run repeats the whole thing. The directory has to go
+///    whole.
+/// 2. Reporting. Every failure here used to be discarded, so a locked extra
+///    survived while the run reported a clean mirror.
 fn delete_extras(
     root: &Path,
     plan: &Plan,
-    _shared: &Shared,
+    shared: &Shared,
     cfg: &EngineConfig,
 ) {
     use std::collections::HashSet;
     let verbose = cfg.verbose;
     let mut keep: HashSet<PathBuf> = plan.entries.iter().map(|e| e.dst.clone()).collect();
+    let keep_files: HashSet<PathBuf> = plan
+        .entries
+        .iter()
+        .filter(|e| e.kind != EntryKind::Dir)
+        .map(|e| e.dst.clone())
+        .collect();
     // The resume journal lives inside the destination and is not part of the
     // source, but deleting it would silently break the next resume.
     keep.insert(root.join(crate::journal::JOURNAL_NAME));
@@ -1933,24 +2274,48 @@ fn delete_extras(
     let mut dirs = Vec::new();
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
+            shared.error(format!("scan destination {}: unreadable", d.display()));
             continue;
         };
         for ent in rd.flatten() {
             let p = ent.path();
             let is_dir = ent.file_type().is_ok_and(|t| t.is_dir());
             if is_dir {
-                stack.push(p.clone());
-                dirs.push(p);
-            } else if !keep.contains(&p) && std::fs::remove_file(&p).is_ok() && verbose >= 2 {
-                eprintln!("  deleted extra {}", p.display());
+                if keep_files.contains(&p) {
+                    // The source has a file here; a directory blocks the copy
+                    // and emptying it would not help.
+                    match std::fs::remove_dir_all(&p) {
+                        | Ok(()) => {
+                            if verbose >= 2 {
+                                eprintln!("  deleted extra tree {}", p.display());
+                            }
+                        },
+                        | Err(e) => shared.error(format!("delete {}: {e}", p.display())),
+                    }
+                } else {
+                    stack.push(p.clone());
+                    dirs.push(p);
+                }
+            } else if !keep.contains(&p) {
+                match std::fs::remove_file(&p) {
+                    | Ok(()) => {
+                        if verbose >= 2 {
+                            eprintln!("  deleted extra {}", p.display());
+                        }
+                    },
+                    | Err(e) => shared.error(format!("delete {}: {e}", p.display())),
+                }
             }
         }
     }
     for d in dirs.iter().rev() {
         // Only drop directories that no longer exist on the source; an empty
         // directory that is still part of the source must survive.
-        if !keep.contains(d) {
-            let _ = std::fs::remove_dir(d);
+        if !keep.contains(d)
+            && let Err(e) = std::fs::remove_dir(d)
+            && e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+        {
+            shared.error(format!("delete dir {}: {e}", d.display()));
         }
     }
 }
@@ -1962,7 +2327,15 @@ fn run_delete(
 ) -> Summary {
     let stats = sirocco_core::stats::Stats::new();
     let mut errors = Vec::new();
-    stats.files_total.store(plan.total_files, Ordering::Relaxed);
+    // `plan.total_files` counts regular files only, while the loop below also
+    // removes symlinks. Counting them here keeps `done <= total`.
+    let links = plan
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Symlink)
+        .count() as u64;
+    let total = plan.total_files + links;
+    stats.files_total.store(total, Ordering::Relaxed);
 
     // Files first, then directories deepest-first. The scan order is not a
     // guarantee (the walk is parallel), so the ordering has to be explicit.
@@ -1975,22 +2348,36 @@ fn run_delete(
 
     for e in plan.entries.iter().filter(|e| e.kind != EntryKind::Dir) {
         let r = match e.kind {
-            | EntryKind::File | EntryKind::Symlink => std::fs::remove_file(&e.src),
+            | EntryKind::File => std::fs::remove_file(&e.src),
+            | EntryKind::Symlink => {
+                // A directory symlink or junction is removed with `rmdir`, not
+                // `unlink`, on Windows; `remove_file` fails and then the parent
+                // `remove_dir` fails as non-empty.
+                if std::fs::symlink_metadata(&e.src).is_ok_and(|m| m.is_dir()) {
+                    std::fs::remove_dir(&e.src)
+                } else {
+                    std::fs::remove_file(&e.src)
+                }
+            },
             | _ => Ok(()),
         };
         match r {
             | Ok(()) => {
-                stats.files_done.fetch_add(1, Ordering::Relaxed);
+                // `Other` is a device, socket or FIFO: nothing was removed, so
+                // counting it would over-report the delete summary.
+                if matches!(e.kind, EntryKind::File | EntryKind::Symlink) {
+                    stats.files_done.fetch_add(1, Ordering::Relaxed);
+                }
             },
             | Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
             | Err(err) => errors.push(format!("delete {}: {err}", e.src.display())),
         }
     }
+    // `dirs_created` stays at zero: a delete creates nothing, and reporting the
+    // removed directories under that name is the kind of number people check.
     for e in dirs {
         match std::fs::remove_dir(&e.src) {
-            | Ok(()) => {
-                stats.dirs_created.fetch_add(1, Ordering::Relaxed);
-            },
+            | Ok(()) => {},
             | Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
             | Err(err) => errors.push(format!("delete {}: {err}", e.src.display())),
         }
@@ -2006,10 +2393,12 @@ fn run_delete(
         mode: cfg.mode,
         stats: stats.snapshot(),
         errors,
-        files_planned: plan.total_files,
+        files_planned: total,
         bytes_planned: plan.total_bytes,
         backend: "none".into(),
         align: 0,
+        readers: 0,
+        writers: 0,
         volume_src: None,
         volume_dst: None,
         interrupted: sirocco_sys::interrupt::is_set(),
@@ -2057,6 +2446,8 @@ fn run_dry(
         bytes_planned: bytes,
         backend: "dry-run".into(),
         align,
+        readers: 0,
+        writers: 0,
         volume_src: None,
         volume_dst: None,
         interrupted: false,
@@ -2273,7 +2664,10 @@ pub fn partition(
                     acc = 0;
                 }
             },
-            | _ => {},
+            // Symlinks and special files were dropped here, so a split run
+            // silently copied fewer entries than the plan and reported success.
+            // They cost no bytes, so they ride along with the current group.
+            | _ => groups[gi].push(e.rel.clone()),
         }
     }
     Ok((groups, dirs, plan.total_bytes))

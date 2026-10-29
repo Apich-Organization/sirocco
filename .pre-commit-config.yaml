@@ -19,11 +19,17 @@ repos:
   - id: shellcheck
 - repo: local
   hooks:
-  # `cargo fmt --check` rather than `cargo fmt`: a pre-commit hook that rewrites
-  # the tree makes the commit message a lie about what was reviewed.
+  # Nightly, and `--check` rather than a rewrite.
+  #
+  # Nightly because `.rustfmt.toml` uses nine keys stable rustfmt ignores; on
+  # stable this hook would pass a tree that CI then rejects, which is the worst
+  # possible split. `--check` because a hook that rewrites the tree makes the
+  # commit message a lie about what was reviewed.
+  #
+  # Requires `rustup toolchain install nightly --component rustfmt`.
   - id: cargo-fmt
-    name: cargo fmt --check
-    entry: cargo fmt --all -- --check
+    name: cargo +nightly fmt --check
+    entry: cargo +nightly fmt --all -- --check
     language: system
     types: [rust]
     pass_filenames: false
