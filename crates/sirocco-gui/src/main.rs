@@ -166,7 +166,7 @@ struct Running {
 /// The engine's [`NumaMode`] carries the node number inside the variant, which a
 /// pick list cannot express: the list needs a fixed set of labels, and the node
 /// is a number the user types or drags. So the two halves are kept apart here and
-/// joined in [`App::config`].
+/// joined in [`App::engine_config`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NumaChoice {
     /// Follow the storage device's node.

@@ -99,14 +99,21 @@ jobs:
 
   # ----------------------------------------------------------------------- docs
   docs:
-    name: rustdoc
-    runs-on: ubuntu-latest
+    # Both platforms, because rustdoc only sees the `cfg` branches it compiles:
+    # `win/` is ~2 000 lines of documented FFI that a Linux-only job never reads,
+    # and `lnx/` is the mirror image.
+    name: rustdoc (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: docs
+          key: docs-${{ matrix.os }}
       - name: Install GUI build dependencies
         if: runner.os == 'Linux'
         run: |
