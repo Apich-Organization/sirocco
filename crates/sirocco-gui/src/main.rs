@@ -4,7 +4,25 @@
 //! that changes while the job runs comes from two places — the `Stats` block the
 //! engine writes directly (no polling thread, no channel per counter) and a plain
 //! `mpsc` feed of per-file events that the update loop drains once per frame.
+//!
+//! # Several sources
+//!
+//! The engine runs one source per session, so the GUI drives a *sequence* of
+//! them: `[src1, src2, …] → dst/<name>`. Each source gets its own `Stats` (the
+//! engine resets the totals when a run starts) and its own counter block is
+//! swapped in as the run advances. The window shows the sum, so the progress bar
+//! never jumps back to zero when the second source begins.
+//!
+//! # No console
+//!
+//! The release binary is a GUI-subsystem executable, so double-clicking it does
+//! not open a terminal next to it. Diagnostics therefore go to a log file
+//! (`%LOCALAPPDATA%\Sirocco\sirocco-gui.log`, or the temp directory when that is
+//! not writable) instead of to a console nobody can see.
 
+// No console window next to the window. `cargo test` is exempt: the harness
+// prints to stdout, and a GUI-subsystem test binary loses that output.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 // The same domain exceptions as the rest of the workspace. A view is a tree of
 // small named functions — one per card — so `single_call_fn` is the normal shape
 // here, not a smell; the rest is layout arithmetic on `f32`.
@@ -18,9 +36,11 @@ mod theme;
 mod ui;
 
 use std::collections::VecDeque;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -40,6 +60,7 @@ use sirocco_core::plan::Mode;
 use sirocco_core::plan::Order;
 use sirocco_core::plan::Overwrite;
 use sirocco_core::plan::VerifyMode;
+use sirocco_core::stats::Snapshot;
 use sirocco_engine::EngineConfig;
 use sirocco_engine::Event;
 use sirocco_engine::config::CompressMode;
@@ -68,9 +89,11 @@ const ACTIVE_CAP: usize = 64;
 const EVENT_BUDGET: usize = 1024;
 
 fn main() -> iced::Result {
+    install_panic_log();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     // The boot function is the first argument (it used to be a trailing
     // `run_with`), and the title is a builder method.
-    iced::application(boot, App::update, App::view)
+    let result = iced::application(move || boot(&args), App::update, App::view)
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
@@ -87,17 +110,28 @@ fn main() -> iced::Result {
             ..iced::window::Settings::default()
         })
         .antialiasing(true)
-        .run()
+        .run();
+    // A window that cannot be created (no GPU, no compositor) has no console to
+    // complain on any more, so it says so in the log before exiting.
+    if let Err(e) = &result {
+        log_line(&format!("cannot start the window: {e}"));
+    }
+    result
 }
 
 /// Initial state, plus the first task.
 ///
 /// `SIROCCO_GUI_SRC` / `SIROCCO_GUI_DST` pre-fill the form and start
 /// immediately: the smoke test uses them, and they are handy for a "make it a
-/// shortcut" setup.
-fn boot() -> (App, Task<Message>) {
-    let app = App::default();
-    let auto = app.src_ready();
+/// shortcut" setup. `--src` / `--dst` / `--privileged` do the same for a
+/// relaunch through the elevation prompt.
+fn boot(args: &[String]) -> (App, Task<Message>) {
+    let mut app = App::default();
+    app.apply_args(args);
+    // Only the environment pre-fills *and* starts: that is the smoke-test path.
+    // A relaunch through the elevation prompt fills the form and leaves the
+    // decision to press Start where it belongs.
+    let auto = app.ready() && std::env::var_os("SIROCCO_GUI_SRC").is_some();
     (
         app,
         if auto {
@@ -106,6 +140,41 @@ fn boot() -> (App, Task<Message>) {
             Task::none()
         },
     )
+}
+
+// ---------------------------------------------------------------- logging
+
+/// Where diagnostics go now that the binary has no console.
+#[must_use]
+pub fn log_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
+    base.join("Sirocco").join("sirocco-gui.log")
+}
+
+/// Append one line to the log. Never fails loudly: a log that cannot be written
+/// must not be the reason a copy does not happen.
+pub fn log_line(msg: &str) {
+    let path = log_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// Record panics, since a GUI build has nowhere else to print them.
+fn install_panic_log() {
+    std::panic::set_hook(Box::new(|info| {
+        log_line(&format!(
+            "panic: {info}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        ));
+    }));
 }
 
 // ---------------------------------------------------------------- state
@@ -148,17 +217,113 @@ pub struct FileRow {
     pub state: RowState,
 }
 
-struct Running {
-    stats: Arc<sirocco_core::stats::Stats>,
+/// Totals from the sources that have already finished.
+///
+/// Kept separately because the engine owns one counter block per session and
+/// zeroes the plan totals when a run starts; adding the finished runs here is
+/// what makes the progress bar and the FILES card describe the whole request
+/// rather than the current source.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Totals {
+    /// Files copied.
+    pub files_done: u64,
+    /// Files already current.
+    pub files_skipped: u64,
+    /// Files that failed.
+    pub files_failed: u64,
+    /// Files planned.
+    pub files_total: u64,
+    /// Bytes that needed no further work.
+    pub bytes_done: u64,
+    /// Bytes planned.
+    pub bytes_total: u64,
+    /// Seconds spent.
+    pub elapsed: f64,
+}
+
+impl Totals {
+    /// Fold one finished source in.
+    fn add(
+        &mut self,
+        s: &Snapshot,
+    ) {
+        self.files_done = self.files_done.saturating_add(s.files_done);
+        self.files_skipped = self.files_skipped.saturating_add(s.files_skipped);
+        self.files_failed = self.files_failed.saturating_add(s.files_failed);
+        self.files_total = self.files_total.saturating_add(s.files_total);
+        self.bytes_done = self.bytes_done.saturating_add(s.bytes_accounted());
+        self.bytes_total = self.bytes_total.saturating_add(s.bytes_total);
+        self.elapsed += s.elapsed_secs;
+    }
+
+    /// Base plus one live source, shaped like a single run's snapshot.
+    #[must_use]
+    pub fn merge(
+        &self,
+        cur: &Snapshot,
+    ) -> Snapshot {
+        let mut s = *cur;
+        s.files_done = self.files_done.saturating_add(cur.files_done);
+        s.files_skipped = self.files_skipped.saturating_add(cur.files_skipped);
+        s.files_failed = self.files_failed.saturating_add(cur.files_failed);
+        s.files_total = self.files_total.saturating_add(cur.files_total);
+        s.bytes_total = self.bytes_total.saturating_add(cur.bytes_total);
+        // `bytes_accounted()` is written + saved, and a punched hole is counted
+        // in both, so the merged figure is carried as plain written bytes.
+        s.bytes_written = self.bytes_done.saturating_add(cur.bytes_accounted());
+        s.bytes_saved = 0;
+        s.bytes_holes = 0;
+        s.elapsed_secs = self.elapsed + cur.elapsed_secs;
+        s
+    }
+}
+
+/// One message from the job thread.
+// `End` carries a whole summary while `Start` carries a handle; the size gap is
+// the point (the UI needs the summary, not a boxed copy of it).
+#[allow(clippy::large_enum_variant)]
+enum JobMsg {
+    /// A source is about to run; this is its counter block.
+    Start {
+        index: usize,
+        name: String,
+        stats: Arc<sirocco_core::stats::Stats>,
+    },
+    /// A source finished.
+    End {
+        result: Result<session::Summary, String>,
+    },
+    /// Every source is done.
+    AllDone,
+}
+
+/// The handle to a running job.
+pub struct Job {
+    /// Sources in the request, so the header can say "2 of 5".
+    pub total: usize,
+    /// Index of the source in flight.
+    pub index: usize,
+    /// Display name of the source in flight.
+    pub name: String,
+    /// Counters of the source in flight.
+    pub stats: Arc<sirocco_core::stats::Stats>,
     events: Receiver<Event>,
-    result: Receiver<Result<session::Summary, String>>,
-    readers: usize,
-    writers: usize,
-    queue_cap: usize,
+    msgs: Receiver<JobMsg>,
+    /// Totals from the sources that already finished.
+    pub base: Totals,
+    /// Summary of the last finished source, for its mode/backend/volume fields.
+    last: Option<session::Summary>,
+    /// Every error seen so far, from every source.
+    errors: Vec<String>,
     /// Bytes at the previous sample, for an instantaneous rate.
     last_bytes: u64,
     last_at: Instant,
     smoothed: f64,
+    /// The user asked to stop; shared with the job thread so it stops feeding
+    /// sources instead of starting the next one.
+    cancel: Arc<AtomicBool>,
+    /// The last source reported an interrupt.
+    cancelled: bool,
 }
 
 /// NUMA placement, as the pick list offers it.
@@ -202,8 +367,10 @@ pub struct App {
     // --- configuration
     /// Copy, move or mirror.
     pub mode: Mode,
-    /// Source path, as typed or dropped.
-    pub src: String,
+    /// What to copy. One or many; the engine takes one at a time.
+    pub sources: Vec<PathBuf>,
+    /// The "or type a path" field.
+    pub path_input: String,
     /// Destination path, as typed or dropped.
     pub dst: String,
     /// Put the source folder *inside* the destination (`cp -r` semantics).
@@ -278,8 +445,6 @@ pub struct App {
     pub small_copy: SmallCopy,
     /// Files at or below this size are candidates for the kernel path.
     pub small: String,
-    /// How many small files to hand to the kernel at once.
-    pub small_batch: u32,
     /// How the destination is sized before writing.
     pub prealloc: PreallocMode,
     /// Order a file's chunks by physical cluster (spinning disks).
@@ -302,7 +467,7 @@ pub struct App {
     /// A calibration is running.
     pub calibrating: bool,
     /// Result channel of a running calibration; drained in `poll`.
-    calib_rx: Option<std::sync::mpsc::Receiver<Option<IoProfile>>>,
+    calib_rx: Option<std::sync::mpsc::Receiver<Result<IoProfile, String>>>,
     /// Destination the running calibration was started against. A measurement
     /// describes one volume, so a result that arrives after the destination
     /// changed is not about anything the user is looking at.
@@ -349,7 +514,7 @@ pub struct App {
     pub status: String,
     /// A request that could not even start.
     pub error: Option<String>,
-    /// Result of the last finished job.
+    /// Result of the last finished job, summed over every source.
     pub summary: Option<session::Summary>,
     /// Frames rendered, used to drive the canvas animations.
     pub tick: u64,
@@ -367,23 +532,84 @@ pub struct App {
     pub caps: String,
     /// What the last privilege request actually returned.
     pub priv_note: Option<String>,
+    /// Whether this process already has administrator rights.
+    pub elevated: bool,
     /// Physical cores, from the topology probe.
     pub cores: usize,
     /// Logical CPUs, which is what bounds `readers + writers`.
     pub logical: usize,
 
     /// A stop was requested. Re-asserted every tick because the engine resets
-    /// the process-wide flag when the job thread starts, which would otherwise
+    /// the process-wide flag when a job thread starts, which would otherwise
     /// swallow a Stop pressed in the first few milliseconds.
     stop_requested: bool,
 
-    running: Option<Running>,
+    job: Option<Job>,
 }
 
 impl App {
-    /// True when the environment supplied a complete job.
-    fn src_ready(&self) -> bool {
-        !self.src.trim().is_empty() && !self.dst.trim().is_empty()
+    /// True when the form describes a job that can be started.
+    fn ready(&self) -> bool {
+        !self.sources.is_empty() && !self.dst.trim().is_empty()
+    }
+
+    /// `--src` / `--dst` / `--privileged`, so a relaunch through the elevation
+    /// prompt lands on the same form.
+    fn apply_args(
+        &mut self,
+        args: &[String],
+    ) {
+        let mut i = 0;
+        while let Some(arg) = args.get(i) {
+            match (arg.as_str(), args.get(i + 1)) {
+                | ("--src", Some(v)) => {
+                    self.add_sources([PathBuf::from(v)]);
+                    i += 2;
+                },
+                | ("--dst", Some(v)) => {
+                    self.dst.clone_from(v);
+                    i += 2;
+                },
+                | ("--privileged", _) => {
+                    self.privileged = true;
+                    i += 1;
+                },
+                | _ => i += 1,
+            }
+        }
+    }
+
+    /// Add sources, skipping ones already in the list.
+    ///
+    /// Compared canonically where both paths resolve, so picking a folder and
+    /// then dropping a file inside it does not produce two entries for one
+    /// directory (`D:\a` vs `D:\a\`).
+    fn add_sources(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) {
+        for p in paths {
+            if p.as_os_str().is_empty() {
+                continue;
+            }
+            if self.sources.iter().any(|q| same_path(q, &p)) {
+                continue;
+            }
+            self.sources.push(p);
+        }
+        self.into = self.into && self.single_dir();
+    }
+
+    /// True when the request is exactly one folder.
+    #[must_use]
+    pub fn single_dir(&self) -> bool {
+        self.sources.len() == 1 && self.sources.first().is_some_and(|p| p.is_dir())
+    }
+
+    /// True when more than one source will be nested into the destination.
+    #[must_use]
+    pub const fn nested(&self) -> bool {
+        self.sources.len() > 1
     }
 
     /// Thread counts the engine will actually use, mirroring `normalize_with`.
@@ -508,17 +734,33 @@ impl App {
                 } else {
                     self.huge
                 };
+                // "0 of 4" is the normal answer for an unelevated process: the
+                // privileges are not in the token at all, so `AdjustTokenPrivileges`
+                // cannot enable them. Saying which case it is saves the user from
+                // concluding the switch is broken.
                 self.priv_note = Some(if held.is_empty() {
-                    "privileges refused".to_string()
+                    if self.elevated {
+                        "the system refused all four privileges".to_string()
+                    } else {
+                        "not elevated — 0 of 4 privileges are in this token; restart as administrator"
+                            .to_string()
+                    }
+                } else if held.len() < wanted.len() {
+                    format!(
+                        "{} of {} privileges enabled: {}",
+                        held.len(),
+                        wanted.len(),
+                        held.join(", ")
+                    )
                 } else {
-                    format!("privileges: {}", held.join(", "))
+                    format!("privileges enabled: {}", held.join(", "))
                 });
                 return huge;
             },
             | Err(e) => {
                 // Not fatal: the run continues on the unprivileged paths, and
                 // saying so beats a dialog the user cannot act on.
-                self.priv_note = Some(format!("privileges unavailable ({e})"));
+                self.priv_note = Some(format!("privileges unavailable: {e}"));
             },
         }
         self.huge
@@ -549,6 +791,33 @@ impl App {
             | _ => None,
         }
     }
+
+    /// The cumulative counters to display: finished sources plus the live one.
+    #[must_use]
+    pub fn live(&self) -> Option<Snapshot> {
+        self.job.as_ref().map(|j| j.base.merge(&j.stats.snapshot()))
+    }
+
+    /// True while the source in flight is still being walked.
+    ///
+    /// The engine stores `files_total` / `bytes_total` once the scan finishes, so
+    /// zero means "not known yet". The progress card needs this separately from
+    /// the merged snapshot: with several sources the merged totals are never
+    /// zero, and the bar would claim 100 % of the sources already done while the
+    /// next one is still being scanned.
+    #[must_use]
+    pub fn current_source_scanning(&self) -> bool {
+        self.job.as_ref().is_some_and(|j| {
+            let s = j.stats.snapshot();
+            s.files_total == 0 && s.bytes_total == 0
+        })
+    }
+
+    /// Totals of the sources that have already finished.
+    #[must_use]
+    pub fn finished_totals(&self) -> Totals {
+        self.job.as_ref().map_or_else(Totals::default, |j| j.base)
+    }
 }
 
 impl Default for App {
@@ -567,9 +836,15 @@ impl Default for App {
         } else {
             format!("{tier} · {}", extra.join(", "))
         };
+        let src = std::env::var("SIROCCO_GUI_SRC").unwrap_or_default();
         Self {
             mode: Mode::Copy,
-            src: std::env::var("SIROCCO_GUI_SRC").unwrap_or_default(),
+            sources: if src.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![PathBuf::from(src.trim())]
+            },
+            path_input: String::new(),
             dst: std::env::var("SIROCCO_GUI_DST").unwrap_or_default(),
             into: false,
             verify: VerifyMode::None,
@@ -606,7 +881,6 @@ impl Default for App {
             direct: true,
             small_copy: SmallCopy::Auto,
             small: "256K".into(),
-            small_batch: 512,
             prealloc: PreallocMode::Auto,
             lcn: true,
             huge: HugeChoice::Auto,
@@ -648,10 +922,11 @@ impl Default for App {
             last_cap: 1,
             caps: caps_line,
             priv_note: None,
+            elevated: caps.elevated,
             cores: topo.physical_count(),
             logical: topo.logical_count(),
             stop_requested: false,
-            running: None,
+            job: None,
         }
     }
 }
@@ -664,11 +939,15 @@ impl Default for App {
 #[allow(missing_docs)]
 pub enum Message {
     ModePicked(Mode),
-    Src(String),
+    PathTyped(String),
+    PathSubmitted,
+    AddFiles,
+    AddFolders,
+    PickedSources(Vec<PathBuf>),
+    RemoveSource(usize),
+    ClearSources,
     Dst(String),
-    BrowseSrc,
     BrowseDst,
-    PickedSrc(Option<PathBuf>),
     PickedDst(Option<PathBuf>),
     Into(bool),
     VerifyPicked(VerifyMode),
@@ -705,7 +984,6 @@ pub enum Message {
     Direct(bool),
     SmallCopyPicked(SmallCopy),
     SmallThresholdPicked(String),
-    SmallBatch(u32),
     PreallocPicked(PreallocMode),
     Lcn(bool),
     HugePicked(HugeChoice),
@@ -724,6 +1002,7 @@ pub enum Message {
     ProcPrioPicked(String),
     ThreadPrioPicked(String),
     Privileged(bool),
+    Elevate,
     ToggleAdvanced,
     Start,
     Cancel,
@@ -775,14 +1054,29 @@ impl App {
     ) -> Task<Message> {
         match msg {
             | Message::ModePicked(m) => self.mode = m,
-            | Message::Src(s) => {
-                // `into` only means something for a folder. Leaving it set when the
-                // source becomes a file produces "needs a folder" with no visible
-                // control to turn it off.
-                if !std::path::Path::new(s.trim()).is_dir() {
-                    self.into = false;
+            | Message::PathTyped(s) => self.path_input = s,
+            | Message::PathSubmitted => {
+                let typed = self.path_input.trim().trim_matches('"').to_string();
+                if !typed.is_empty() {
+                    self.add_sources([PathBuf::from(typed)]);
+                    self.path_input.clear();
                 }
-                self.src = s;
+            },
+            | Message::AddFiles => return Task::perform(pick_files(), Message::PickedSources),
+            | Message::AddFolders => return Task::perform(pick_folders(), Message::PickedSources),
+            | Message::PickedSources(v) => {
+                self.add_sources(v);
+                return Task::none();
+            },
+            | Message::RemoveSource(i) => {
+                if i < self.sources.len() {
+                    self.sources.remove(i);
+                    self.into = self.into && self.single_dir();
+                }
+            },
+            | Message::ClearSources => {
+                self.sources.clear();
+                self.into = false;
             },
             | Message::Dst(s) => {
                 // The measured rates describe the destination volume; keeping them
@@ -801,17 +1095,13 @@ impl App {
                 }
                 self.dst = s;
             },
-            | Message::BrowseSrc => return Task::perform(pick_folder(), Message::PickedSrc),
             | Message::BrowseDst => return Task::perform(pick_folder(), Message::PickedDst),
-            | Message::PickedSrc(Some(p)) => {
-                return self.update(Message::Src(p.to_string_lossy().to_string()));
-            },
             | Message::PickedDst(Some(p)) => {
                 // Through `Dst`, not straight into the field: the browse button
                 // has to invalidate the measured rates exactly like typing does.
                 return self.update(Message::Dst(p.to_string_lossy().to_string()));
             },
-            | Message::PickedSrc(None) | Message::PickedDst(None) => {},
+            | Message::PickedDst(None) => {},
             | Message::Into(v) => self.into = v,
             | Message::VerifyPicked(v) => self.verify = v,
             | Message::OverwritePicked(o) => self.overwrite = o,
@@ -859,7 +1149,6 @@ impl App {
             | Message::Direct(v) => self.direct = v,
             | Message::SmallCopyPicked(m) => self.small_copy = m,
             | Message::SmallThresholdPicked(s) => self.small = s,
-            | Message::SmallBatch(n) => self.small_batch = n,
             | Message::PreallocPicked(m) => self.prealloc = m,
             | Message::Lcn(v) => self.lcn = v,
             | Message::HugePicked(h) => self.huge = h,
@@ -882,7 +1171,11 @@ impl App {
                     std::thread::Builder::new()
                         .name("sirocco-calibrate".into())
                         .spawn(move || {
-                            let _ = tx.send(session::calibrate(&dst).ok());
+                            // The reason travels with the result: "calibration
+                            // failed" with no explanation is what made this
+                            // button look broken.
+                            let r = session::calibrate(&dst).map_err(|e| e.to_string());
+                            let _ = tx.send(r);
                         })
                         .ok();
                 }
@@ -896,6 +1189,28 @@ impl App {
             | Message::ProcPrioPicked(s) => self.proc_prio = s,
             | Message::ThreadPrioPicked(s) => self.thread_prio = s,
             | Message::Privileged(v) => self.privileged = v,
+            | Message::Elevate => {
+                // `set_privileges` can only enable what the token already holds.
+                // Getting the rest means a new process with a UAC prompt, which
+                // is the one thing this window cannot do to itself.
+                let mut args = Vec::new();
+                for s in &self.sources {
+                    args.push("--src".to_string());
+                    args.push(s.to_string_lossy().into_owned());
+                }
+                if !self.dst.trim().is_empty() {
+                    args.push("--dst".to_string());
+                    args.push(self.dst.trim().to_string());
+                }
+                args.push("--privileged".to_string());
+                return match sirocco_sys::relaunch_elevated(&args) {
+                    | Ok(()) => iced::exit(),
+                    | Err(e) => {
+                        self.error = Some(format!("cannot restart elevated: {e}"));
+                        Task::none()
+                    },
+                };
+            },
             | Message::ToggleAdvanced => self.advanced = !self.advanced,
             | Message::Clear => {
                 // Wiping the feed while a job is running would desynchronise the
@@ -911,23 +1226,22 @@ impl App {
                 }
             },
             | Message::Dropped(p) => {
-                // Dropping a folder fills the first empty field, then the other.
                 // A drop during a run is ignored: the job already captured its
                 // paths, so rewriting them would only desynchronise the form.
+                //
+                // A drop is always a *source*. Filling the destination from the
+                // second drop onwards made "drop three files here" impossible and
+                // made the same gesture mean two different things.
                 if !self.is_running() {
-                    let s = p.to_string_lossy().to_string();
-                    if self.src.is_empty() {
-                        return self.update(Message::Src(s));
-                    }
-                    // Through `Dst`, not straight into the field: a dropped
-                    // destination has to invalidate the measured rates exactly
-                    // like a typed one.
-                    return self.update(Message::Dst(s));
+                    self.add_sources([p]);
                 }
             },
-            | Message::Start => self.start(),
+            | Message::Start => return self.start(),
             | Message::Cancel => {
-                if self.running.is_some() {
+                if let Some(job) = self.job.as_ref() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                if self.job.is_some() {
                     self.stop_requested = true;
                     sirocco_sys::interrupt::flag().store(true, Ordering::Relaxed);
                     self.status = "Stopping…".into();
@@ -998,7 +1312,9 @@ impl App {
             journal: self.journal,
             sync_at_end: self.sync,
             dry_run: self.dry_run,
-            into: self.into,
+            // `into` only means something for a single folder source; with
+            // several, each one is nested by construction.
+            into: self.into && self.single_dir(),
             index: self.index,
             index_dir: (!self.index_dir.trim().is_empty())
                 .then(|| PathBuf::from(self.index_dir.trim())),
@@ -1015,7 +1331,6 @@ impl App {
             direct_io: self.direct,
             small_copy: self.small_copy,
             small_threshold: size_of(&self.small, 256 << 10),
-            small_batch: self.small_batch as usize,
             prealloc: self.prealloc,
             reorder_lcn: self.lcn,
             // Three states, not two: `Auto` leaves both flags false so the
@@ -1067,31 +1382,53 @@ impl App {
         }
     }
 
-    fn start(&mut self) {
+    /// Validate, then start the job.
+    ///
+    /// Every check runs before anything is spawned or any privilege is raised, so
+    /// a typo never costs the previous run's report.
+    // One linear validation-and-launch block: every check must run before the
+    // next, and splitting it would only scatter the "nothing has happened yet"
+    // invariant across helpers.
+    #[allow(clippy::too_many_lines)]
+    fn start(&mut self) -> Task<Message> {
         if self.is_running() {
-            return;
+            return Task::none();
         }
-        // Validation first: a typo in the destination must not destroy the last
-        // run's feed, chart and failure list.
-        if self.src.trim().is_empty() || self.dst.trim().is_empty() {
-            self.error = Some("Both a source and a destination are required.".into());
-            return;
+        self.error = None;
+        if self.sources.is_empty() {
+            self.error = Some("Add at least one file or folder to copy.".into());
+            return Task::none();
         }
-        let src = PathBuf::from(self.src.trim());
+        if self.dst.trim().is_empty() {
+            self.error = Some("A destination is required.".into());
+            return Task::none();
+        }
         let dst = PathBuf::from(self.dst.trim());
-        if !src.exists() {
-            self.error = Some(format!("{} does not exist", src.display()));
-            return;
+        for src in &self.sources {
+            if !src.exists() {
+                self.error = Some(format!("{} does not exist", src.display()));
+                return Task::none();
+            }
         }
-        if self.into && !src.is_dir() {
-            self.error = Some("“Copy into” needs a folder as the source.".into());
-            return;
+        if self.nested() && dst.exists() && !dst.is_dir() {
+            self.error = Some(
+                "Several sources need a folder as the destination — each one is placed inside it."
+                    .into(),
+            );
+            return Task::none();
         }
-        // A destination inside the source is copied into itself: the second run
-        // duplicates the duplicate until the disk fills.
-        if src.is_dir() && is_inside(&dst, &src) {
-            self.error = Some("The destination is inside the source.".into());
-            return;
+        // A destination inside a source is copied into itself: the second run
+        // duplicates the duplicate until the disk fills. This applies to every
+        // source, not just the single-source case — with several, the scan of
+        // one source would still walk into the destination the others write to.
+        for src in &self.sources {
+            if src.is_dir() && is_inside(&dst, src) {
+                self.error = Some(format!(
+                    "The destination is inside the source {}.",
+                    src.display()
+                ));
+                return Task::none();
+            }
         }
 
         // A CPU list that does not parse would silently fall back to the default
@@ -1103,20 +1440,16 @@ impl App {
                 "cannot parse the CPU list: {}",
                 self.cpu_list.trim()
             ));
-            return;
+            return Task::none();
         }
 
         let (exclude, e1) = pattern_set(&self.exclude, &self.exclude_from);
         let (include, e2) = pattern_set(&self.include, &self.include_from);
         if let Some(e) = e1.or(e2) {
             self.error = Some(e);
-            return;
+            return Task::none();
         }
 
-        // Every check above can fail without side effects, which is why they run
-        // first: a typo in the CPU list must not escalate the token or rewrite
-        // the capability line. Only from here does the run actually start.
-        //
         // The flag is cleared here, on the UI thread, so a Stop pressed before
         // the job thread reaches its own reset is not discarded.
         sirocco_sys::interrupt::reset();
@@ -1131,12 +1464,15 @@ impl App {
             self.huge
         };
 
-        // Same ordering as the CLI's `apply_privileged`: raise the privileges
-        // first, then let the capability probe that follows see the result.
-        // Every check above can fail without side effects, so the previous run's
-        // results survive a typo in any of the fields they read. Below this point
-        // the run actually starts.
-        self.error = None;
+        // With several sources the destination is the folder they land in, so it
+        // has to exist before the first per-source run starts nesting into it.
+        if self.nested()
+            && let Err(e) = std::fs::create_dir_all(&dst)
+        {
+            self.error = Some(format!("cannot create {}: {e}", dst.display()));
+            return Task::none();
+        }
+
         self.summary = None;
         self.feed.clear();
         self.active.clear();
@@ -1153,67 +1489,260 @@ impl App {
         // drain, and an unbounded channel turns that into a memory spike plus one
         // enormous frame. A dropped row costs a line in the feed, not a counter.
         let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel(EVENT_BUDGET);
-        let (res_tx, res_rx) = std::sync::mpsc::channel();
-        cfg.events = Some(sirocco_engine::config::EventSink::Bounded(ev_tx));
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
 
-        let stats = Arc::new(sirocco_core::stats::Stats::new());
-        let stats_for_job = stats.clone();
         // `queue_depth` is per queue and `Counters.queued` sums both, so the
         // capacity shown has to be the sum. It comes from the normalised config,
         // which means an explicit depth and the engine's floor both apply — a
         // meter that can read "16 / 2" is worse than no meter.
         let queue_cap = 2 * cfg.queue_depth.max(1);
-        // Read before the config is moved into the job thread; these are the
-        // numbers the meters have to divide by.
         let (final_readers, final_writers) = (cfg.readers, cfg.writers);
 
+        let sources = self.sources.clone();
+        let cancel_for_job = cancel.clone();
         std::thread::Builder::new()
             .name("sirocco-gui-job".into())
             .spawn(move || {
-                let r = session::run_with(cfg, src, dst, Some(stats_for_job))
-                    .map_err(|e| e.to_string());
-                let _ = res_tx.send(r);
+                run_sources(&cfg, &sources, &dst, &ev_tx, &msg_tx, &cancel_for_job);
             })
             .ok();
 
         self.last_readers = final_readers;
         self.last_writers = final_writers;
         self.last_cap = queue_cap.max(1);
-        self.running = Some(Running {
-            stats,
+        self.job = Some(Job {
+            total: self.sources.len(),
+            index: 0,
+            name: display_name(self.sources.first()),
+            stats: Arc::new(sirocco_core::stats::Stats::new()),
             events: ev_rx,
-            result: res_rx,
-            readers: final_readers,
-            writers: final_writers,
-            queue_cap,
+            msgs: msg_rx,
+            base: Totals::default(),
+            last: None,
+            errors: Vec::new(),
             last_bytes: 0,
             last_at: Instant::now(),
             smoothed: 0.0,
+            cancel,
+            cancelled: false,
         });
         self.phase = Phase::Running;
-        self.status = match self.mode {
-            | _ if self.dry_run => "Previewing…".into(),
-            | Mode::Move => "Moving…".into(),
-            | Mode::Sync => "Mirroring…".into(),
-            | _ => "Copying…".into(),
+        self.status = self.running_status();
+        Task::none()
+    }
+
+    /// The header line while a job runs.
+    fn running_status(&self) -> String {
+        let verb = match self.mode {
+            | _ if self.dry_run => "Previewing",
+            | Mode::Move => "Moving",
+            | Mode::Sync => "Mirroring",
+            | _ => "Copying",
         };
+        match self.job.as_ref() {
+            | Some(j) if j.total > 1 => {
+                format!("{verb} {} of {} — {}", j.index + 1, j.total, j.name)
+            },
+            | _ => format!("{verb}…"),
+        }
     }
 
     /// One frame: read the engine's counters, drain the event feed, fold both
     /// into the visible state.
-    // The steps are ordered and share local state (`snap`, `events`, `result`);
+    // The steps are ordered and share local state (`snap`, `events`, `msgs`);
     // splitting them would mean passing six values through each helper.
     #[allow(clippy::too_many_lines)]
     fn poll(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.poll_calibration();
 
-        // A calibration writes real data; on a slow or full destination it can
-        // block far longer than the couple of seconds it is designed for. Without
-        // a deadline the button stays disabled on "Measuring…" with no way out.
+        if self.stop_requested {
+            // The engine resets the flag once when a run starts; keep asserting
+            // it until the job actually stops.
+            sirocco_sys::interrupt::flag().store(true, Ordering::Relaxed);
+        }
+
+        // Read everything out of the job handle first, then mutate `self`: the
+        // handle borrows `self.job` and the row lists borrow `self`.
+        let Some((msgs, events, snap, rate, now, name)) = self.read_job() else {
+            return;
+        };
+
+        if let Some(job) = self.job.as_mut() {
+            job.last_bytes = snap.bytes_accounted();
+            job.last_at = now;
+            job.smoothed = rate;
+        }
+        if self.history.len() >= SAMPLES {
+            self.history.remove(0);
+        }
+        self.history.push(rate as f32);
+
+        // Events first: a source that ended and the next one that started arrive
+        // in the same tick, and the old source's rows belong to the old name.
+        //
+        // The prefix is only added when there is more than one source; with a
+        // single folder, `src/a/b.txt` is noise that pushes the interesting part
+        // of the path out of the row.
+        let prefix = if self.job.as_ref().is_some_and(|j| j.total > 1) {
+            name.as_str()
+        } else {
+            ""
+        };
+        for ev in events {
+            match ev {
+                | Event::Started { rel, size } => self.mark_active(prefix, &rel, size),
+                | Event::Done { rel, size, .. } => {
+                    self.mark_done(prefix, &rel, size, RowState::Done);
+                },
+                | Event::Skipped { rel } => {
+                    self.mark_done(prefix, &rel, 0, RowState::Skipped);
+                },
+                | Event::Failed { rel, error } => {
+                    self.mark_done(prefix, &rel, 0, RowState::Failed(error));
+                },
+                | Event::Finished { .. } => {},
+            }
+        }
+
+        let mut finished = false;
+        for msg in msgs {
+            match msg {
+                | JobMsg::Start { index, name, stats } => {
+                    if let Some(job) = self.job.as_mut() {
+                        job.index = index;
+                        job.name = name;
+                        job.stats = stats;
+                        job.last_bytes = 0;
+                        job.last_at = Instant::now();
+                        job.smoothed = 0.0;
+                    }
+                    self.status = self.running_status();
+                },
+                | JobMsg::End { result } => self.source_finished(result),
+                | JobMsg::AllDone => finished = true,
+            }
+        }
+        if finished {
+            self.finish_job();
+        }
+    }
+
+    /// Drain the job's channels and sample its counters.
+    ///
+    /// Returns `None` when no job is running. The name is the source the events
+    /// belong to, so rows can be labelled when several sources are in play.
+    #[allow(clippy::type_complexity)]
+    fn read_job(&self) -> Option<(Vec<JobMsg>, Vec<Event>, Snapshot, f64, Instant, String)> {
+        let job = self.job.as_ref()?;
+        let mut msgs = Vec::new();
+        while let Ok(m) = job.msgs.try_recv() {
+            msgs.push(m);
+        }
+        let snap = job.stats.snapshot();
+        let now = Instant::now();
+        // Same accounting as the progress bar: bytes that never needed writing
+        // (delta hits, punched holes, hard links) count as progress, or the chart
+        // would show a slow run while the bar races to the end.
+        let done = snap.bytes_accounted();
+        let dt = (now - job.last_at).as_secs_f64().max(1e-6);
+        let instant = done.saturating_sub(job.last_bytes) as f64 / dt;
+        // Light smoothing: per-tick deltas are noisy at 90 ms, but a cumulative
+        // average hides a stall completely.
+        let rate = instant.mul_add(0.45, job.smoothed * 0.55);
+        // Bounded per frame: an unbounded drain makes one frame do work
+        // proportional to a whole directory, which is exactly when the window
+        // should stay responsive. The rest is read on the next tick.
+        let mut events = Vec::new();
+        while events.len() < EVENT_BUDGET {
+            match job.events.try_recv() {
+                | Ok(ev) => events.push(ev),
+                | Err(_) => break,
+            }
+        }
+        Some((msgs, events, snap, rate, now, job.name.clone()))
+    }
+
+    /// A source finished: fold its totals in, or record why it failed.
+    fn source_finished(
+        &mut self,
+        result: Result<session::Summary, String>,
+    ) {
+        let reason = {
+            let Some(job) = self.job.as_mut() else {
+                return;
+            };
+            match result {
+                | Ok(sum) => {
+                    job.base.add(&sum.stats);
+                    job.errors.extend(sum.errors.iter().cloned());
+                    job.cancelled |= sum.interrupted;
+                    // A file whose terminal event was dropped by the bounded
+                    // channel must not stay "in flight" through the next source.
+                    let reason = if sum.interrupted {
+                        Some("cancelled")
+                    } else if sum.stats.files_failed > 0 {
+                        Some("run ended")
+                    } else {
+                        None
+                    };
+                    job.last = Some(sum);
+                    reason
+                },
+                | Err(e) => {
+                    // The request itself was refused (missing source, source
+                    // equal to destination, unusable volume). The other sources
+                    // still run.
+                    job.errors.push(e);
+                    Some("run ended")
+                },
+            }
+        };
+        self.flush_active(reason);
+    }
+
+    /// The last source is done: build the cumulative report and settle the phase.
+    fn finish_job(&mut self) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let base = job.base;
+        let mut sum = job.last.unwrap_or_else(|| empty_summary(self.mode));
+        sum.stats = base.merge(&Snapshot::default());
+        sum.stats.elapsed_secs = base.elapsed;
+        sum.errors = job.errors;
+        sum.files_planned = base.files_total;
+        sum.bytes_planned = base.bytes_total;
+        sum.interrupted = job.cancelled;
+
+        self.phase = if sum.interrupted {
+            Phase::Cancelled
+        } else if sum.stats.files_failed > 0 || !sum.errors.is_empty() {
+            Phase::Failed
+        } else {
+            Phase::Done
+        };
+        self.status = describe(&sum, self.mode);
+        self.flush_active(if sum.interrupted {
+            Some("cancelled")
+        } else if sum.stats.files_failed > 0 {
+            Some("run ended")
+        } else {
+            None
+        });
+        self.summary = Some(sum);
+        self.stop_requested = false;
+    }
+
+    /// A calibration writes real data; on a slow or full destination it can
+    /// block far longer than the couple of seconds it is designed for. Without a
+    /// deadline the button stays disabled on "Measuring…" with no way out.
+    fn poll_calibration(&mut self) {
         if self.calibrating
             && self
                 .calib_at
-                .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(120))
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(120))
         {
             self.calib_rx = None;
             self.calib_at = None;
@@ -1221,209 +1750,49 @@ impl App {
             self.calibration = "calibration timed out".to_string();
         }
 
-        if let Some(rx) = &self.calib_rx {
-            match rx.try_recv() {
-                | Ok(p) => {
-                    self.calib_rx = None;
-                    self.calib_at = None;
-                    self.calibrating = false;
-                    // A failed measurement keeps the previous profile: throwing
-                    // away a good one because a retry failed is not an improvement.
-                    // A result for a destination the user has since changed is a
-                    // measurement of some other volume; showing it would be a lie
-                    // that looks exactly like a valid one.
-                    if self.calib_for.as_deref() != Some(std::path::Path::new(self.dst.trim())) {
-                        self.calibration = "destination changed; measure again".to_string();
-                    } else if let Some(p) = p {
-                        self.io_profile = Some(p);
-                        self.calibration = format!(
-                            "read {} · write {} · dest read {}",
-                            format_rate(p.read_bps),
-                            format_rate(p.write_bps),
-                            format_rate(p.dest_read_bps)
-                        );
-                    } else {
-                        self.calibration = "calibration failed".to_string();
-                    }
-                },
-                // The thread died (panic, or the spawn itself failed): stop
-                // pretending it is still measuring, or the button stays disabled.
-                | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.calib_rx = None;
-                    self.calib_at = None;
-                    self.calibrating = false;
-                    self.calibration = "calibration failed".to_string();
-                },
-                | Err(std::sync::mpsc::TryRecvError::Empty) => {},
-            }
-        }
-
-        // Read everything out of the job handle first, then mutate `self`: the
-        // handle borrows `self.running` and the row lists borrow `self`.
-        if self.stop_requested {
-            // The engine resets the flag once when the job starts; keep asserting
-            // it until the job actually stops.
-            sirocco_sys::interrupt::flag().store(true, Ordering::Relaxed);
-        }
-
-        let Some(run) = self.running.as_ref() else {
+        let Some(rx) = &self.calib_rx else {
             return;
         };
-        let snap = run.stats.snapshot();
-        let now = Instant::now();
-        // Same accounting as the progress bar: bytes that never needed writing
-        // (delta hits, punched holes, hard links) count as progress, or the chart
-        // would show a slow run while the bar races to the end.
-        let done_bytes = snap.bytes_accounted();
-        let dt = (now - run.last_at).as_secs_f64().max(1e-6);
-        let instant = done_bytes.saturating_sub(run.last_bytes) as f64 / dt;
-        // Light smoothing: per-tick deltas are noisy at 90 ms, but a cumulative
-        // average hides a stall completely.
-        let rate = instant.mul_add(0.45, run.smoothed * 0.55);
-        // Bounded per frame: an unbounded drain makes one frame do work
-        // proportional to a whole directory, which is exactly when the window
-        // should stay responsive. The rest is read on the next tick.
-        let mut events = Vec::new();
-        let mut drained = false;
-        while events.len() < EVENT_BUDGET {
-            match run.events.try_recv() {
-                | Ok(ev) => events.push(ev),
-                | Err(_) => {
-                    drained = true;
-                    break;
-                },
-            }
-        }
-        // The result is only taken once the queue is empty. Taking it while events
-        // were still buffered dropped the receiver (and those events) a line later,
-        // so the FILES feed ended short of the count the card reported.
-        let result = if drained {
-            run.result.try_recv().ok()
-        } else {
-            None
-        };
-        let readers = run.readers;
-        let writers = run.writers;
-
-        if let Some(run) = self.running.as_mut() {
-            run.last_bytes = done_bytes;
-            run.last_at = now;
-            run.smoothed = rate;
-        }
-        if self.history.len() >= SAMPLES {
-            self.history.remove(0);
-        }
-        self.history.push(rate as f32);
-
-        for ev in events {
-            match ev {
-                | Event::Started { rel, size } => self.mark_active(&rel, size),
-                | Event::Done { rel, size, .. } => self.mark_done(&rel, size, RowState::Done),
-                | Event::Skipped { rel } => self.mark_done(&rel, 0, RowState::Skipped),
-                | Event::Failed { rel, error } => {
-                    self.mark_done(&rel, 0, RowState::Failed(error));
-                },
-                | Event::Finished { .. } => {},
-            }
-        }
-
-        match result {
-            | Some(Ok(sum)) => {
-                self.phase = if sum.interrupted {
-                    Phase::Cancelled
-                } else if sum.stats.files_failed > 0 || !sum.errors.is_empty() {
-                    Phase::Failed
+        match rx.try_recv() {
+            | Ok(result) => {
+                self.calib_rx = None;
+                self.calib_at = None;
+                self.calibrating = false;
+                // A failed measurement keeps the previous profile: throwing away
+                // a good one because a retry failed is not an improvement. A
+                // result for a destination the user has since changed is a
+                // measurement of some other volume; showing it would be a lie
+                // that looks exactly like a valid one.
+                let moved = self
+                    .calib_for
+                    .as_deref()
+                    .is_none_or(|p| p != Path::new(self.dst.trim()));
+                if moved {
+                    self.calibration = "destination changed; measure again".to_string();
                 } else {
-                    Phase::Done
-                };
-                self.status = match self.mode {
-                    // A stopped run must not be described in the completed voice:
-                    // the pill already says STOPPED, and for a Move the difference
-                    // is whether the tree is half-moved.
-                    | _ if sum.interrupted => {
-                        format!(
-                            "Stopped after {} files, {} copied, in {}",
-                            sum.stats.files_done + sum.stats.files_skipped,
-                            sum.stats.files_done,
-                            format_duration(sum.stats.elapsed_secs)
-                        )
-                    },
-                    // A preview reports a plan, not counters: "Copied 0 files" would
-                    // be technically true and completely useless.
-                    | _ if sum.backend == "dry-run" => {
-                        format!(
-                            "Preview: {} files, {} to copy",
-                            sum.files_planned,
-                            format_bytes(sum.bytes_planned)
-                        )
-                    },
-                    | Mode::Move if sum.stats.files_failed > 0 => {
-                        format!(
-                            "Moved {} files, {} failed, in {}",
-                            sum.stats.files_done,
-                            sum.stats.files_failed,
-                            format_duration(sum.stats.elapsed_secs)
-                        )
-                    },
-                    | Mode::Move => {
-                        format!(
-                            "Moved {} files in {}",
-                            sum.stats.files_done,
-                            format_duration(sum.stats.elapsed_secs)
-                        )
-                    },
-                    | Mode::Sync => {
-                        format!(
-                            "Mirrored in {} — {} copied, {} already current",
-                            format_duration(sum.stats.elapsed_secs),
-                            sum.stats.files_done,
-                            sum.stats.files_skipped
-                        )
-                    },
-                    | _ => {
-                        // "Copied 0 files" over a tree where everything was already
-                        // current reads as a broken tool, not as success; and a run
-                        // with failures must not be described in the success voice.
-                        if sum.stats.files_failed > 0 {
-                            format!(
-                                "Copied {} files, {} failed, in {}",
-                                sum.stats.files_done,
-                                sum.stats.files_failed,
-                                format_duration(sum.stats.elapsed_secs)
-                            )
-                        } else if sum.stats.files_skipped > 0 {
-                            format!(
-                                "Copied {} files in {} — {} already current",
-                                sum.stats.files_done,
-                                format_duration(sum.stats.elapsed_secs),
-                                sum.stats.files_skipped
-                            )
-                        } else {
-                            format!(
-                                "Copied {} files in {}",
-                                sum.stats.files_done,
-                                format_duration(sum.stats.elapsed_secs)
-                            )
-                        }
-                    },
-                };
-                let cancelled = sum.interrupted;
-                self.summary = Some(sum);
-                self.flush_active(cancelled.then_some("cancelled"));
-                self.running = None;
-                self.stop_requested = false;
+                    match result {
+                        | Ok(p) => {
+                            self.io_profile = Some(p);
+                            self.calibration = format!(
+                                "read {} · write {} · dest read {}",
+                                format_rate(p.read_bps),
+                                format_rate(p.write_bps),
+                                format_rate(p.dest_read_bps)
+                            );
+                        },
+                        | Err(e) => self.calibration = format!("failed: {e}"),
+                    }
+                }
             },
-            | Some(Err(e)) => {
-                self.phase = Phase::Failed;
-                self.status = "Stopped with an error".into();
-                self.error = Some(e);
-                self.flush_active(Some("run ended"));
-                self.running = None;
-                self.stop_requested = false;
+            // The thread died (panic, or the spawn itself failed): stop
+            // pretending it is still measuring, or the button stays disabled.
+            | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.calib_rx = None;
+                self.calib_at = None;
+                self.calibrating = false;
+                self.calibration = "calibration failed".to_string();
             },
-            | None => {
-                let _ = (readers, writers);
-            },
+            | Err(std::sync::mpsc::TryRecvError::Empty) => {},
         }
     }
 
@@ -1431,10 +1800,11 @@ impl App {
     /// skipped-then-retried file must not produce two rows.
     fn mark_active(
         &mut self,
-        rel: &std::path::Path,
+        source: &str,
+        rel: &Path,
         size: u64,
     ) {
-        let rel = rel.to_string_lossy().replace('\\', "/");
+        let rel = label(source, rel);
         if let Some(row) = self.active.iter_mut().find(|r| r.rel == rel) {
             row.size = size;
             row.state = RowState::Active;
@@ -1454,11 +1824,12 @@ impl App {
     /// the feed, in one row rather than two.
     fn mark_done(
         &mut self,
-        rel: &std::path::Path,
+        source: &str,
+        rel: &Path,
         size: u64,
         state: RowState,
     ) {
-        let rel = rel.to_string_lossy().replace('\\', "/");
+        let rel = label(source, rel);
         let size = match self.active.iter().position(|r| r.rel == rel) {
             | Some(i) => {
                 let row = self.active.remove(i);
@@ -1472,9 +1843,6 @@ impl App {
         }
     }
 
-    /// Anything still in flight when the job ends. A clean run finishes only
-    /// after every chunk has landed, so those are done; an interrupted one may
-    /// have left them half-written, which must not be reported as success.
     /// Settle the rows still in flight when the run ends.
     ///
     /// `reason` is `None` when the job finished normally; otherwise it is what
@@ -1504,13 +1872,187 @@ impl App {
     }
 }
 
-/// Split a comma/space separated pattern list.
-/// Inline globs plus the lines of a pattern file.
+// ---------------------------------------------------------------- job thread
+
+/// Run every source in order, reporting each one over the same two channels.
 ///
-/// Same shape as `--exclude` / `--exclude-from`: blank lines and `#` comments are
-/// skipped, everything else is a pattern. The error is returned rather than
-/// swallowed: a pattern file that cannot be read must not silently become "no
-/// patterns", which would copy exactly what the user excluded.
+/// The engine's `run_with` is one source per call and resets the counter totals
+/// when it starts, so a multi-source request is a sequence of sessions with a
+/// fresh `Stats` each. The UI sums them; see [`Totals`].
+fn run_sources(
+    cfg: &EngineConfig,
+    sources: &[PathBuf],
+    dst: &Path,
+    events: &std::sync::mpsc::SyncSender<Event>,
+    msgs: &std::sync::mpsc::Sender<JobMsg>,
+    cancel: &AtomicBool,
+) {
+    let nested = sources.len() > 1;
+    for (i, src) in sources.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let stats = Arc::new(sirocco_core::stats::Stats::new());
+        if msgs
+            .send(JobMsg::Start {
+                index: i,
+                name: display_name(Some(src)),
+                stats: stats.clone(),
+            })
+            .is_err()
+        {
+            return;
+        }
+        let mut c = cfg.clone();
+        c.events = Some(sirocco_engine::config::EventSink::Bounded(events.clone()));
+        // Several sources always land inside the destination directory; one
+        // source keeps the engine's own rule (a folder merges, a file is the
+        // destination itself).
+        let target = if nested {
+            dst.join(src.file_name().unwrap_or_default())
+        } else {
+            dst.to_path_buf()
+        };
+        let r = session::run_with(c, src.clone(), target, Some(stats)).map_err(|e| e.to_string());
+        let interrupted = r.as_ref().is_ok_and(|s| s.interrupted);
+        if msgs.send(JobMsg::End { result: r }).is_err() {
+            return;
+        }
+        if interrupted {
+            break;
+        }
+    }
+    let _ = msgs.send(JobMsg::AllDone);
+}
+
+/// How a source is named in the header and in front of its feed rows.
+fn display_name(p: Option<&PathBuf>) -> String {
+    p.and_then(|p| p.file_name()).map_or_else(
+        || p.map_or_else(String::new, |p| p.display().to_string()),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// Prefix a source-relative path with its source when there is more than one.
+///
+/// Two sources can both contain `a/b.txt`; without the prefix the feed shows two
+/// identical rows and the user cannot tell which one failed.
+fn label(
+    source: &str,
+    rel: &Path,
+) -> String {
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    if source.is_empty() {
+        rel
+    } else {
+        format!("{source}/{rel}")
+    }
+}
+
+/// A summary for a request that never produced one.
+fn empty_summary(mode: Mode) -> session::Summary {
+    session::Summary {
+        mode,
+        stats: Snapshot::default(),
+        errors: Vec::new(),
+        files_planned: 0,
+        bytes_planned: 0,
+        backend: String::new(),
+        align: 0,
+        readers: 0,
+        writers: 0,
+        volume_src: None,
+        volume_dst: None,
+        interrupted: false,
+    }
+}
+
+/// `1 file` / `2 files`, because "Copied 1 files" is the kind of detail that
+/// makes a careful program look careless.
+fn files(n: u64) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{n} files")
+    }
+}
+
+/// One sentence describing a finished job.
+fn describe(
+    sum: &session::Summary,
+    mode: Mode,
+) -> String {
+    let took = format_duration(sum.stats.elapsed_secs);
+    if sum.interrupted {
+        return format!(
+            "Stopped after {} files, {} copied, in {took}",
+            sum.stats.files_done + sum.stats.files_skipped,
+            sum.stats.files_done,
+        );
+    }
+    if sum.backend == "dry-run" {
+        // A preview reports a plan, not counters: "Copied 0 files" would be
+        // technically true and completely useless.
+        return format!(
+            "Preview: {} files, {} to copy",
+            sum.files_planned,
+            format_bytes(sum.bytes_planned)
+        );
+    }
+    let failed = sum.stats.files_failed;
+    match mode {
+        | Mode::Move if failed > 0 => {
+            format!(
+                "Moved {}, {failed} failed, in {took}",
+                files(sum.stats.files_done)
+            )
+        },
+        | Mode::Move => format!("Moved {} in {took}", files(sum.stats.files_done)),
+        | Mode::Sync => {
+            format!(
+                "Mirrored in {took} — {} copied, {} already current",
+                sum.stats.files_done, sum.stats.files_skipped
+            )
+        },
+        // "Copied 0 files" over a tree where everything was already current
+        // reads as a broken tool, not as success; and a run with failures must
+        // not be described in the success voice.
+        | _ if failed > 0 => {
+            format!(
+                "Copied {}, {failed} failed, in {took}",
+                files(sum.stats.files_done)
+            )
+        },
+        | _ if sum.stats.files_skipped > 0 => {
+            format!(
+                "Copied {} in {took} — {} already current",
+                files(sum.stats.files_done),
+                sum.stats.files_skipped
+            )
+        },
+        | _ => format!("Copied {} in {took}", files(sum.stats.files_done)),
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+
+/// True when two paths name the same thing.
+///
+/// `canonicalize` is the reliable answer but fails for a path that does not
+/// exist, which is normal for a destination; the literal comparison covers that.
+fn same_path(
+    a: &Path,
+    b: &Path,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        | (Ok(x), Ok(y)) => x == y,
+        | _ => false,
+    }
+}
+
 /// True when `dst` sits inside `src`.
 ///
 /// `dst` usually does not exist yet, so its parent is canonicalised instead and
@@ -1534,6 +2076,12 @@ fn is_inside(
     full.is_some_and(|d| d != root && d.starts_with(&root))
 }
 
+/// Inline globs plus the lines of a pattern file.
+///
+/// Same shape as `--exclude` / `--exclude-from`: blank lines and `#` comments are
+/// skipped, everything else is a pattern. The error is returned rather than
+/// swallowed: a pattern file that cannot be read must not silently become "no
+/// patterns", which would copy exactly what the user excluded.
 fn pattern_set(
     inline: &str,
     from_file: &str,
@@ -1572,6 +2120,22 @@ async fn pick_folder() -> Option<PathBuf> {
         .map(|h| h.path().to_path_buf())
 }
 
+async fn pick_files() -> Vec<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .pick_files()
+        .await
+        .map(|v| v.into_iter().map(|h| h.path().to_path_buf()).collect())
+        .unwrap_or_default()
+}
+
+async fn pick_folders() -> Vec<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .pick_folders()
+        .await
+        .map(|v| v.into_iter().map(|h| h.path().to_path_buf()).collect())
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------- shared helpers
 
 impl App {
@@ -1585,25 +2149,25 @@ impl App {
 
     /// Current counters, or `None` when no job is running.
     #[must_use]
-    pub fn snap(&self) -> Option<sirocco_core::stats::Snapshot> {
-        self.running.as_ref().map(|r| r.stats.snapshot())
+    pub fn snap(&self) -> Option<Snapshot> {
+        self.live()
     }
 
     /// (readers, writers, readers busy, writers busy, queued, queue capacity)
     #[must_use]
     pub fn gauges(&self) -> (usize, usize, usize, usize, usize, usize) {
-        self.running.as_ref().map_or(
+        self.job.as_ref().map_or(
             // Idle: keep the last shape, all meters empty.
             (self.last_readers, self.last_writers, 0, 0, 0, self.last_cap),
-            |run| {
-                let s = run.stats.snapshot();
+            |job| {
+                let s = job.stats.snapshot();
                 (
-                    run.readers,
-                    run.writers,
-                    (s.readers_active as usize).min(run.readers),
-                    (s.writers_active as usize).min(run.writers),
+                    self.last_readers,
+                    self.last_writers,
+                    (s.readers_active as usize).min(self.last_readers),
+                    (s.writers_active as usize).min(self.last_writers),
                     s.queued as usize,
-                    run.queue_cap.max(1),
+                    self.last_cap.max(1),
                 )
             },
         )
@@ -1712,5 +2276,162 @@ mod tests {
         });
         assert_eq!(cfg.readers, 3);
         assert_eq!(cfg.writers, 4);
+    }
+
+    /// `into` is a `cp -r` flag for a single folder. With several sources the
+    /// engine already nests each one, so forwarding it would nest twice.
+    #[test]
+    fn into_only_applies_to_a_single_folder() {
+        let dir = std::env::temp_dir();
+        let single = App {
+            sources: vec![dir.clone()],
+            into: true,
+            ..App::default()
+        };
+        assert!(config_of(&single).into);
+
+        let many = App {
+            sources: vec![dir.clone(), dir],
+            into: true,
+            ..App::default()
+        };
+        assert!(!config_of(&many).into);
+    }
+
+    /// Duplicates are dropped, including the `D:\a` vs `D:\a\` spelling that a
+    /// picker and a drop produce for the same folder.
+    #[test]
+    fn sources_are_deduplicated() {
+        let mut app = App::default();
+        let dir = std::env::temp_dir();
+        app.add_sources([dir.clone(), dir]);
+        assert_eq!(app.sources.len(), 1);
+
+        app.add_sources([PathBuf::new()]);
+        assert_eq!(app.sources.len(), 1, "an empty path is not a source");
+    }
+
+    /// A request with no source, or no destination, must not start.
+    #[test]
+    fn start_requires_both_ends() {
+        let mut app = App::default();
+        let _ = app.start();
+        assert!(app.error.is_some());
+        assert!(!app.is_running());
+
+        let mut app = App {
+            sources: vec![std::env::temp_dir()],
+            ..App::default()
+        };
+        let _ = app.start();
+        assert!(app.error.is_some());
+        assert!(!app.is_running());
+    }
+
+    /// The totals of several sources have to look like one run: the progress bar
+    /// reads `bytes_accounted()` over `bytes_total`.
+    #[test]
+    fn totals_merge_across_sources() {
+        let mut base = Totals::default();
+        base.add(&Snapshot {
+            files_total: 10,
+            files_done: 10,
+            bytes_total: 1000,
+            bytes_written: 1000,
+            elapsed_secs: 2.0,
+            ..Snapshot::default()
+        });
+
+        let second = Snapshot {
+            files_total: 5,
+            files_done: 2,
+            bytes_total: 500,
+            bytes_written: 200,
+            elapsed_secs: 1.0,
+            ..Snapshot::default()
+        };
+
+        let live = base.merge(&second);
+        assert_eq!(live.files_total, 15);
+        assert_eq!(live.files_done, 12);
+        assert_eq!(live.bytes_total, 1500);
+        assert_eq!(live.bytes_accounted(), 1200);
+        assert!((live.elapsed_secs - 3.0).abs() < f64::EPSILON);
+    }
+
+    /// Two sources can hold the same relative path; the feed has to tell them
+    /// apart or a failure looks like it belongs to the wrong file.
+    #[test]
+    fn feed_rows_are_prefixed_by_source() {
+        assert_eq!(label("a", Path::new("x/y.txt")), "a/x/y.txt");
+        assert_eq!(label("", Path::new("x/y.txt")), "x/y.txt");
+    }
+
+    /// The whole multi-source path, end to end: two folders in, each nested under
+    /// its own name, two `End` messages, one `AllDone`.
+    ///
+    /// This is the part a window cannot be unit-tested through, so it is tested
+    /// as the plain function it is.
+    #[test]
+    fn several_sources_run_in_sequence_and_nest() {
+        let root = std::env::temp_dir().join(format!("sirocco-gui-ms-{}", std::process::id()));
+        let a = root.join("alpha");
+        let b = root.join("beta");
+        let dst = root.join("out");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("one.txt"), b"one").unwrap();
+        std::fs::write(b.join("two.txt"), b"two").unwrap();
+
+        let cfg = EngineConfig {
+            quiet: true,
+            verbose: 0,
+            ..EngineConfig::default()
+        };
+        let (ev_tx, _ev_rx) = std::sync::mpsc::sync_channel(64);
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        run_sources(
+            &cfg,
+            &[a, b],
+            &dst,
+            &ev_tx,
+            &msg_tx,
+            &AtomicBool::new(false),
+        );
+
+        let mut starts = 0;
+        let mut ends = 0;
+        let mut all_done = false;
+        // `recv` rather than `iter`: the sender lives in this test, so the
+        // channel never closes and `iter()` would wait for a drop that cannot
+        // happen.
+        while let Ok(m) = msg_rx.recv() {
+            match m {
+                | JobMsg::Start { .. } => starts += 1,
+                | JobMsg::End { result } => {
+                    if let Err(e) = result {
+                        panic!("source failed: {e}");
+                    }
+                    ends += 1;
+                },
+                | JobMsg::AllDone => {
+                    all_done = true;
+                    break;
+                },
+            }
+        }
+        assert_eq!(starts, 2);
+        assert_eq!(ends, 2);
+        assert!(all_done);
+        assert_eq!(
+            std::fs::read(dst.join("alpha").join("one.txt")).unwrap(),
+            b"one"
+        );
+        assert_eq!(
+            std::fs::read(dst.join("beta").join("two.txt")).unwrap(),
+            b"two"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

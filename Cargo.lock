@@ -2632,7 +2632,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sirocco-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sirocco-core",
  "sirocco-engine",
@@ -2641,11 +2641,11 @@ dependencies = [
 
 [[package]]
 name = "sirocco-core"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "sirocco-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "sirocco-core",
  "sirocco-sys",
@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "sirocco-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "iced",
  "rfd",
@@ -2664,7 +2664,7 @@ dependencies = [
 
 [[package]]
 name = "sirocco-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
 ]

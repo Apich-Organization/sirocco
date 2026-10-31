@@ -5,6 +5,8 @@
 //! "what exactly is happening". Every surface uses the same radius scale
 //! (12 / 8 / 6) and the same spacing rhythm (4 / 8 / 12 / 16).
 
+use std::path::Path;
+
 use iced::Alignment;
 use iced::Color;
 use iced::Element;
@@ -131,39 +133,20 @@ fn rail(app: &App) -> Element<'_, Message> {
 
     col = col
         .push(gap(16.0))
-        .push(path_field(
-            "SOURCE",
-            &app.src,
-            Message::Src,
-            Message::BrowseSrc,
-            "a folder or a file",
-            !app.is_running(),
-        ))
-        .push(gap(12.0))
-        .push(path_field(
-            "DESTINATION",
-            &app.dst,
-            Message::Dst,
-            Message::BrowseDst,
-            "where it should land",
-            !app.is_running(),
-        ));
+        .push(sources_card(app))
+        .push(gap(14.0))
+        .push(destination_card(app));
 
-    // `into` only means something when the source is a folder. It is also
+    // `into` only means something when the request is one folder. It is also
     // settled before the scan runs, so flipping it mid-job would change nothing
     // while looking like it did.
-    if std::path::Path::new(app.src.trim()).is_dir() {
+    if app.single_dir() {
         let boxed: iced::widget::Checkbox<'_, Message> = checkbox(app.into)
             .label("Copy the folder itself into the destination")
             .size(15)
             .text_size(th::T_BODY)
             .style(th::checkbox_style);
-        let boxed: Element<'_, Message> = if app.is_running() {
-            boxed.into()
-        } else {
-            boxed.on_toggle(Message::Into).into()
-        };
-        col = col.push(gap(6.0)).push(boxed);
+        col = col.push(gap(6.0)).push(boxed.on_toggle(Message::Into));
     }
 
     col = col
@@ -208,7 +191,6 @@ fn rail(app: &App) -> Element<'_, Message> {
             "*.tmp, node_modules, .git",
             &app.exclude,
             Message::Exclude,
-            !app.is_running(),
         ))
         .push(gap(10.0))
         .push(eyebrow("INCLUDE"))
@@ -217,7 +199,6 @@ fn rail(app: &App) -> Element<'_, Message> {
             "leave empty for everything",
             &app.include,
             Message::Include,
-            !app.is_running(),
         ))
         .push(gap(10.0))
         .push(choice(
@@ -438,45 +419,20 @@ fn notice(
         .into()
 }
 
-/// A text field that stops accepting input while a job is running, so the form
-/// cannot drift away from the paths the engine is actually using.
+/// A text field. Always live: every value in the form describes the *next* run,
+/// and freezing a control the engine already captured only hides the setting
+/// without protecting anything.
 fn input_or_static<'a>(
     hint: &'a str,
     value: &'a str,
     on: fn(String) -> Message,
-    enabled: bool,
 ) -> Element<'a, Message> {
-    let field = text_input(hint, value)
+    text_input(hint, value)
         .padding([9, 10])
         .size(th::T_BODY)
-        .style(th::input);
-    if enabled {
-        field.on_input(on).into()
-    } else {
-        field.into()
-    }
-}
-
-fn path_field<'a>(
-    label: &'a str,
-    value: &'a str,
-    on: fn(String) -> Message,
-    browse: Message,
-    hint: &'a str,
-    enabled: bool,
-) -> Element<'a, Message> {
-    let mut link = button(text("Browse").size(10).color(th::MUTED))
-        .padding([3, 7])
-        .style(th::ghost);
-    if enabled {
-        link = link.on_press(browse);
-    }
-    column![
-        row![eyebrow(label), spacer(), link].align_y(Alignment::Center),
-        gap(5.0),
-        input_or_static(hint, value, on, enabled),
-    ]
-    .into()
+        .style(th::input)
+        .on_input(on)
+        .into()
 }
 
 fn choice<'a>(
@@ -500,7 +456,8 @@ fn choice<'a>(
 /// `choice`, for a list computed at render time.
 ///
 /// The list is owned rather than borrowed because it depends on another control
-/// (the buffer size); `pick_list` takes it by value, so nothing dangles.
+/// (the buffer size, the effective delta block); `pick_list` takes it by value,
+/// so nothing dangles.
 fn choice_owned<'a>(
     label: &'a str,
     options: Vec<&'a str>,
@@ -519,6 +476,166 @@ fn choice_owned<'a>(
     .into()
 }
 
+// ---------------------------------------------------------------- sources
+
+/// What to copy: a list, because "copy these three files here" is the common
+/// request and a folder-only picker cannot express it.
+fn sources_card(app: &App) -> Element<'_, Message> {
+    let mut list = column![].spacing(4);
+    if app.sources.is_empty() {
+        list = list.push(
+            container(
+                text("Nothing selected yet — add files, a folder, or drop them here.")
+                    .size(11)
+                    .color(th::FAINT),
+            )
+            .width(Length::Fill)
+            .padding([8, 9])
+            .style(th::well),
+        );
+    }
+    for (i, p) in app.sources.iter().enumerate() {
+        list = list.push(source_row(app, i, p));
+    }
+
+    // Typing a path still works: a picker that starts in the wrong folder is
+    // slower than pasting a path, and a drop cannot reach a network share.
+    let typed = text_input("or type a path and press Enter", &app.path_input)
+        .padding([9, 10])
+        .size(th::T_BODY)
+        .style(th::input)
+        .on_input(Message::PathTyped)
+        .on_submit(Message::PathSubmitted);
+
+    column![
+        row![
+            eyebrow("SOURCE"),
+            spacer(),
+            mini_button("Files…", Some(Message::AddFiles)),
+            hgap(4.0),
+            mini_button("Folder…", Some(Message::AddFolders)),
+        ]
+        .align_y(Alignment::Center),
+        gap(6.0),
+        list,
+        gap(6.0),
+        typed,
+    ]
+    .into()
+}
+
+fn source_row(
+    app: &App,
+    i: usize,
+    p: &Path,
+) -> Element<'static, Message> {
+    let is_dir = p.is_dir();
+    let name = p.file_name().map_or_else(
+        || p.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let parent = p
+        .parent()
+        .map(|x| x.display().to_string())
+        .unwrap_or_default();
+    let remove = if app.is_running() {
+        None
+    } else {
+        Some(Message::RemoveSource(i))
+    };
+
+    container(
+        row![
+            tag(
+                if is_dir { "DIR" } else { "FILE" },
+                if is_dir {
+                    th::ACCENT
+                } else {
+                    th::MUTED
+                }
+            ),
+            column![
+                text(truncate(&name, 34))
+                    .size(th::T_BODY)
+                    .color(th::TEXT)
+                    .width(Length::Fill),
+                text(truncate(&parent, 42)).size(9).color(th::FAINT),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+            mini_button("×", remove),
+        ]
+        .align_y(Alignment::Center)
+        .spacing(6),
+    )
+    .width(Length::Fill)
+    .padding([6, 8])
+    .style(th::well)
+    .into()
+}
+
+fn tag(
+    label: &str,
+    color: Color,
+) -> Element<'static, Message> {
+    container(text(label.to_string()).size(8).font(bold()).color(color))
+        .width(Length::Fixed(30.0))
+        .padding([2, 0])
+        .center_x(Length::Fixed(30.0))
+        .style(th::chip(color))
+        .into()
+}
+
+/// A small inline button. `None` renders it disabled, which is what a control
+/// that cannot act right now should look like.
+fn mini_button(
+    label: &str,
+    on: Option<Message>,
+) -> Element<'static, Message> {
+    button(text(label.to_string()).size(10).color(if on.is_some() {
+        th::MUTED
+    } else {
+        th::FAINT
+    }))
+    .padding([3, 7])
+    .style(th::ghost)
+    .on_press_maybe(on)
+    .into()
+}
+
+fn destination_card(app: &App) -> Element<'_, Message> {
+    let enabled = !app.is_running();
+    let browse = if enabled {
+        Some(Message::BrowseDst)
+    } else {
+        None
+    };
+    let label = if app.nested() {
+        "DESTINATION FOLDER"
+    } else {
+        "DESTINATION"
+    };
+    let mut col = column![
+        row![eyebrow(label), spacer(), mini_button("Browse", browse),].align_y(Alignment::Center),
+        gap(5.0),
+        text_input("where it should land", &app.dst)
+            .padding([9, 10])
+            .size(th::T_BODY)
+            .style(th::input)
+            .on_input_maybe(enabled.then_some(Message::Dst as fn(String) -> Message)),
+    ];
+    if app.nested() {
+        col = col.push(gap(5.0)).push(
+            text("Each source is placed inside this folder under its own name.")
+                .size(10)
+                .color(th::FAINT),
+        );
+    }
+    col.into()
+}
+
+// ---------------------------------------------------------------- toggles
+
 fn toggles(app: &App) -> Element<'_, Message> {
     let mut c = column![].spacing(6);
     for (label, value, msg) in [
@@ -533,36 +650,30 @@ fn toggles(app: &App) -> Element<'_, Message> {
         ("Flush to disk before finishing", app.sync, Message::Sync),
         ("Plan only — change nothing", app.dry_run, Message::DryRun),
     ] {
-        c = c.push(toggle_one(app, label, value, msg));
+        c = c.push(toggle_one(label, value, msg));
     }
     c.into()
 }
 
-/// One checkbox row. A toggle that changes nothing until the next run is a lie
-/// while the current one is still going, so it loses its handler instead.
-fn toggle_one<'a>(
-    app: &'a App,
-    label: &'a str,
+/// One checkbox row.
+///
+/// Live even while a job runs: the value describes the next run, and a checkbox
+/// that silently ignores clicks is indistinguishable from a broken one. The
+/// header says what the running job is doing; this form is the next request.
+fn toggle_one(
+    label: &str,
     value: bool,
     on: fn(bool) -> Message,
-) -> Element<'a, Message> {
+) -> Element<'_, Message> {
     let boxed: iced::widget::Checkbox<'_, Message> = checkbox(value)
         .label(label)
         .size(15)
         .text_size(th::T_BODY)
         .style(th::checkbox_style);
-    if app.is_running() {
-        boxed.into()
-    } else {
-        boxed.on_toggle(on).into()
-    }
+    boxed.on_toggle(on).into()
 }
 
 /// A labelled integer slider, used where the value is a small count.
-///
-/// Always live, like the thread slider: a slider only writes the value the next
-/// run will use, so freezing it mid-run would hide the setting without protecting
-/// anything.
 fn num_row(
     label: &str,
     range: std::ops::RangeInclusive<f32>,
@@ -763,14 +874,38 @@ fn delta_min_from(s: &str) -> Message {
 /// The I/O units a given buffer size can actually use.
 ///
 /// `normalize_with` clamps `io_unit` to `buffer_size`, so offering a larger one
-/// would put a number on screen that the engine silently replaces.
-fn io_unit_opts(buffer: &str) -> Vec<&'static str> {
+/// would put a number on screen that the engine silently replaces. The current
+/// value is kept in the list even when the buffer has since shrunk below it,
+/// because a `pick_list` whose selected value is not among its options renders
+/// blank.
+fn io_unit_opts<'a>(
+    buffer: &str,
+    current: &'a str,
+) -> Vec<&'a str> {
     let limit = sirocco_core::human::parse_size(buffer).unwrap_or(1 << 20);
-    BUFFER_OPTS
+    let mut out: Vec<&str> = BUFFER_OPTS
         .iter()
         .copied()
         .filter(|o| sirocco_core::human::parse_size(o).is_some_and(|v| v <= limit))
-        .collect()
+        .collect();
+    if !out.contains(&current) {
+        out.push(current);
+    }
+    out
+}
+
+/// The delta block labels, plus whatever `normalize_with` derived.
+///
+/// Picking "1M" while the buffer is 2M leaves the engine at 1M, but a derived
+/// block of "2M" is not in the fixed list; without adding it the list would show
+/// nothing at all.
+fn delta_block_opts(app: &App) -> Vec<&str> {
+    let mut out: Vec<&str> = DELTA_BLOCK_OPTS.to_vec();
+    let label = app.delta_block_label();
+    if !out.contains(&label) {
+        out.push(label);
+    }
+    out
 }
 
 fn buffer_from(s: &str) -> Message {
@@ -794,10 +929,13 @@ fn thread_prio_from(s: &str) -> Message {
 }
 
 fn advanced_toggle(app: &App) -> Element<'_, Message> {
+    // The label names what is behind it: "Advanced settings" alone is the kind of
+    // door nobody opens, and every engine, scheduling and privilege control lives
+    // on the other side.
     let label = if app.advanced {
-        "Hide advanced settings"
+        "Hide engine, scheduling and privilege settings"
     } else {
-        "Advanced settings"
+        "Engine, scheduling and privilege settings"
     };
     button(centered(text(label).size(th::T_BODY)))
         .width(Length::Fill)
@@ -813,7 +951,6 @@ fn engine_group(app: &App) -> Element<'_, Message> {
         eyebrow("ENGINE"),
         gap(8.0),
         toggle_one(
-            app,
             "Direct I/O — bypass the page cache",
             app.direct,
             Message::Direct
@@ -822,14 +959,12 @@ fn engine_group(app: &App) -> Element<'_, Message> {
         choice("LARGE PAGES", &HUGE_OPTS, huge_label(app.huge), huge_from),
         gap(6.0),
         toggle_one(
-            app,
             "Physical order per file (spinning disks)",
             app.lcn,
             Message::Lcn
         ),
         gap(6.0),
         toggle_one(
-            app,
             "Block delta and append-only updates",
             app.delta,
             Message::Delta
@@ -867,7 +1002,7 @@ fn engine_group(app: &App) -> Element<'_, Message> {
         gap(12.0),
         choice_owned(
             "I/O UNIT",
-            io_unit_opts(&app.buffer),
+            io_unit_opts(&app.buffer, &app.io_unit),
             &app.io_unit,
             io_unit_from
         ),
@@ -942,14 +1077,6 @@ fn parallel_group(app: &App) -> Element<'_, Message> {
         eyebrow("SMALL-FILE TUNING"),
         gap(8.0),
         choice("SMALL THRESHOLD", &BUFFER_OPTS, &app.small, small_from_size),
-        gap(8.0),
-        num_row(
-            "Small batch",
-            1.0..=4096.0,
-            app.small_batch,
-            app.small_batch.to_string(),
-            Message::SmallBatch
-        ),
     ]
     .into()
 }
@@ -963,9 +1090,9 @@ fn delta_group(app: &App) -> Element<'_, Message> {
         // "auto" follows the I/O unit, which is what the engine derives when the
         // block is left alone. Without it, picking 1M while the card shows 8M was
         // silently ignored.
-        choice(
+        choice_owned(
             "DELTA BLOCK",
-            &DELTA_BLOCK_OPTS,
+            delta_block_opts(app),
             app.delta_block_label(),
             delta_block_from
         ),
@@ -999,17 +1126,14 @@ fn calibrate_row(app: &App) -> Element<'_, Message> {
     let label = if app.calibrating {
         "Measuring…"
     } else {
-        "Measure throughput"
+        "Measure destination speed"
     };
+    let ready = !app.calibrating && !app.is_running() && !app.dst.trim().is_empty();
     let button = button(centered(text(label).size(th::T_BODY)))
         .width(Length::Fill)
         .padding([7, 0])
-        .style(th::ghost);
-    let button = if app.calibrating || app.is_running() || app.dst.trim().is_empty() {
-        button
-    } else {
-        button.on_press(Message::Calibrate)
-    };
+        .style(th::ghost)
+        .on_press_maybe(ready.then_some(Message::Calibrate));
     let note = if app.calibration.is_empty() {
         "Feeds the delta cost model with measured rates. Without it the model assumes equal-speed media and rules delta out."
             .to_string()
@@ -1028,7 +1152,6 @@ fn scheduling_group(app: &App) -> Element<'_, Message> {
         // engine pins whenever one is set. Showing `app.pin` alone would make the
         // checkbox disagree with the config it produces.
         toggle_one(
-            app,
             if app.cpu_list.trim().is_empty() {
                 "Pin I/O threads to disjoint cores"
             } else {
@@ -1043,8 +1166,7 @@ fn scheduling_group(app: &App) -> Element<'_, Message> {
         input_or_static(
             "0-3,8-11 — empty for every CPU",
             &app.cpu_list,
-            Message::CpuList,
-            !app.is_running()
+            Message::CpuList
         ),
         gap(12.0),
         choice("NUMA", &NUMA_OPTS, numa_label(app.numa), numa_from),
@@ -1088,16 +1210,14 @@ fn fidelity_group(app: &App) -> Element<'_, Message> {
         eyebrow("FIDELITY"),
         gap(8.0),
         toggle_one(
-            app,
             "Copy permission bits and attributes",
             app.perms,
             Message::Perms
         ),
         gap(6.0),
-        toggle_one(app, "Copy extended attributes", app.xattrs, Message::Xattrs),
+        toggle_one("Copy extended attributes", app.xattrs, Message::Xattrs),
         gap(6.0),
         toggle_one(
-            app,
             "Keep modification times",
             app.keep_times,
             Message::KeepTimes
@@ -1114,7 +1234,6 @@ fn fidelity_group(app: &App) -> Element<'_, Message> {
             },
             &app.index_dir,
             Message::IndexDir,
-            !app.is_running() && app.index != IndexMode::Off
         ),
     ]
     .into()
@@ -1126,18 +1245,12 @@ fn filters_group(app: &App) -> Element<'_, Message> {
         eyebrow("FILTERS"),
         gap(8.0),
         toggle_one(
-            app,
             "Follow symbolic links",
             app.follow_links,
             Message::FollowLinks
         ),
         gap(6.0),
-        toggle_one(
-            app,
-            "Stay on the source filesystem",
-            app.one_fs,
-            Message::OneFs
-        ),
+        toggle_one("Stay on the source filesystem", app.one_fs, Message::OneFs),
         // The engine honours `delete_extra` only in Sync, where it is always on.
         // A checkbox that cannot be turned off is worse than a sentence.
         gap(6.0),
@@ -1154,8 +1267,7 @@ fn filters_group(app: &App) -> Element<'_, Message> {
         input_or_static(
             "one glob per line, # for comments",
             &app.exclude_from,
-            Message::ExcludeFrom,
-            !app.is_running()
+            Message::ExcludeFrom
         ),
         gap(10.0),
         eyebrow("INCLUDE FILE"),
@@ -1163,8 +1275,7 @@ fn filters_group(app: &App) -> Element<'_, Message> {
         input_or_static(
             "one glob per line, # for comments",
             &app.include_from,
-            Message::IncludeFrom,
-            !app.is_running()
+            Message::IncludeFrom
         ),
         gap(10.0),
         num_row(
@@ -1184,8 +1295,7 @@ fn filters_group(app: &App) -> Element<'_, Message> {
         input_or_static(
             "a file of paths, one per line",
             &app.files_from,
-            Message::FilesFrom,
-            !app.is_running()
+            Message::FilesFrom
         ),
     ]
     .into()
@@ -1193,11 +1303,10 @@ fn filters_group(app: &App) -> Element<'_, Message> {
 
 /// The privileged paths, and the switch that asks for them.
 fn privileges_group(app: &App) -> Element<'_, Message> {
-    column![
+    let mut col = column![
         eyebrow("PRIVILEGES"),
         gap(8.0),
         toggle_one(
-            app,
             "Request privileges before starting",
             app.privileged,
             Message::Privileged
@@ -1209,8 +1318,35 @@ fn privileges_group(app: &App) -> Element<'_, Message> {
         )
         .size(10)
         .color(th::FAINT),
-    ]
-    .into()
+        gap(8.0),
+        text(if app.elevated {
+            "running elevated — the token can be granted these privileges"
+        } else if cfg!(windows) {
+            "not elevated — Windows does not put these privileges in a standard token, \
+             so they can only be enabled by a process started through UAC."
+        } else {
+            "not root — on Linux the capabilities come from the credentials at exec \
+             time; start the binary under sudo to hold them."
+        })
+        .size(10)
+        .color(if app.elevated {
+            th::OK
+        } else {
+            th::WARN
+        }),
+    ];
+    // Only Windows can raise itself through the shell. Showing the button
+    // elsewhere would promise something the platform cannot do.
+    if cfg!(windows) && !app.elevated {
+        col = col.push(gap(8.0)).push(
+            button(centered(text("Restart as administrator").size(th::T_BODY)))
+                .width(Length::Fill)
+                .padding([7, 0])
+                .style(th::ghost)
+                .on_press(Message::Elevate),
+        );
+    }
+    col.into()
 }
 
 fn threads_row(app: &App) -> Element<'_, Message> {
@@ -1278,12 +1414,8 @@ fn actions(app: &App) -> Element<'_, Message> {
     let clear = button(centered(text("Clear").size(th::T_BODY)))
         .width(Length::Fixed(78.0))
         .padding([11, 0])
-        .style(th::ghost);
-    let clear = if running {
-        clear
-    } else {
-        clear.on_press(Message::Clear)
-    };
+        .style(th::ghost)
+        .on_press_maybe((!running).then_some(Message::Clear));
 
     row![primary, clear].spacing(8).into()
 }
@@ -1406,9 +1538,11 @@ fn stats_row(app: &App) -> Element<'_, Message> {
 
     // While running, the card and the chart must agree: both read the
     // instantaneous rate. Once the run is over there is no "instantaneous" left,
-    // and the last 90 ms sample would freeze the biggest number on screen at
-    // whatever the final partial tick happened to catch.
-    let speed = if idle {
+    // and the last 90 ms sample is whatever the final partial tick happened to
+    // catch — usually zero, which made a finished 2 GiB/s copy read "0 B/s".
+    let speed = if app.is_running() {
+        f64::from(app.history.last().copied().unwrap_or(0.0))
+    } else {
         app.summary.as_ref().map_or(0.0, |s| {
             if s.stats.elapsed_secs > 0.0 {
                 s.stats.bytes_accounted() as f64 / s.stats.elapsed_secs
@@ -1416,8 +1550,6 @@ fn stats_row(app: &App) -> Element<'_, Message> {
                 0.0
             }
         })
-    } else {
-        f64::from(app.history.last().copied().unwrap_or(0.0))
     };
 
     let (done, total, eta, elapsed) = if app.is_preview() {
@@ -1480,15 +1612,29 @@ fn progress_card(app: &App) -> Element<'_, Message> {
 
     // Counters stay at zero until the walk finishes, and `progress()` reports 1.0
     // for an empty plan. Painting "100.0 %" over a scan that has not produced a
-    // single number yet would be the worst kind of lie.
-    let scanning = app.is_running() && s.is_none_or(|s| s.bytes_total == 0 && s.files_total == 0);
+    // single number yet would be the worst kind of lie. With several sources the
+    // bar keeps the finished work on screen while the next source is scanned.
+    let scanning = app.is_running() && app.current_source_scanning();
+    let base = app.finished_totals();
+    let base_pct = if base.bytes_total > 0 {
+        (base.bytes_done as f64 / base.bytes_total as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
 
     let (pct, done, total, failed) = match &s {
         | Some(_) if app.is_preview() => {
             let sum = app.summary.as_ref().unwrap();
             (0.0, 0, sum.bytes_planned, 0)
         },
-        | Some(_) if scanning => (0.0, 0, 0, 0),
+        | Some(_) if scanning => {
+            (
+                base_pct,
+                base.bytes_done,
+                base.bytes_total,
+                base.files_failed,
+            )
+        },
         // A mirror that finds everything already current writes no bytes, so the
         // byte ratio would read 0 % on a job that is completely finished. When
         // every planned file has been accounted for, that is 100 %.
@@ -1713,7 +1859,7 @@ fn feed_card(app: &App) -> Element<'_, Message> {
                 column![
                     text("Nothing yet").size(th::T_BODY).color(th::MUTED),
                     gap(3.0),
-                    text("Drop a folder on the window, or type a path, then press Start.")
+                    text("Drop files or a folder on the window, pick them in the rail, then press Start.")
                         .size(11)
                         .color(th::FAINT),
                 ]

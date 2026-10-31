@@ -766,3 +766,24 @@ unsafe extern "system" {
 
 pub const FILE_DEVICE_UNKNOWN: u32 = 0x22;
 pub const FILE_ANY_ACCESS_X: u32 = 0;
+
+// ---------------------------------------------------------------- shell
+//
+// One call, used for one thing: re-launching this process through the `runas`
+// verb so the UAC prompt appears. Everything else the shell offers is a way to
+// make a copy engine depend on Explorer, which is the opposite of the point.
+#[link(name = "shell32")]
+unsafe extern "system" {
+    pub fn ShellExecuteW(
+        hwnd: *mut c_void,
+        lpOperation: *const u16,
+        lpFile: *const u16,
+        lpParameters: *const u16,
+        lpDirectory: *const u16,
+        nShowCmd: i32,
+    ) -> isize;
+}
+
+pub const SW_SHOWNORMAL: i32 = 1;
+/// `ShellExecuteW` returns a value <= 32 on failure; the number is the error.
+pub const SHELLEXEC_SUCCESS_MIN: isize = 32;

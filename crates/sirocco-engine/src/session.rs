@@ -2727,41 +2727,162 @@ pub const fn describe_order(o: Order) -> &'static str {
 
 /// Calibrate read/write throughput with a small temporary transfer.
 ///
-/// Used by `--calibrate` to feed the delta cost model real numbers instead of the
-/// defaults.
-pub fn calibrate(dst_dir: &Path) -> std::io::Result<IoProfile> {
-    let path = dst_dir.join(".sirocco-calib.tmp");
-    let size = 64u64 << 20;
-    let mut buf = vec![0u8; 1 << 20];
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = (i * 31) as u8;
+/// Used by `--calibrate` and by the GUI's "measure" button to feed the delta
+/// cost model real numbers instead of the defaults.
+///
+/// `dst` is whatever the user pointed at: an existing directory, a directory
+/// that does not exist yet, or the target *file* of a single-file copy. The
+/// measurement is taken in the nearest existing directory at or above it, which
+/// is the volume the copy will actually write to.
+///
+/// # Errors
+///
+/// Returns the OS error from creating, writing or reading the temporary file.
+/// The file is removed on every path out, including an early return.
+pub fn calibrate(dst: &Path) -> std::io::Result<IoProfile> {
+    // 64 MiB is large enough to leave the drive's own write cache behind and
+    // small enough that nobody minds it appearing for a second.
+    const SIZE: u64 = 64 << 20;
+    const CHUNK: usize = 1 << 20;
+
+    let dir = measure_dir(dst)?;
+    let path = dir.join(format!(".sirocco-calib-{}.tmp", std::process::id()));
+    let _guard = CalibFile(path.clone());
+
+    // Direct I/O needs aligned memory; the buffer pool's allocator is the one
+    // already in the tree, so the calibration cannot drift from the engine's
+    // own alignment rules.
+    let mut src = sirocco_sys::align::AlignedBlock::new(CHUNK, false)?;
+    for (i, b) in src.as_mut_slice().iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(31) as u8;
     }
-    let f = RawFile::open(
-        &path,
-        &OpenOpts {
-            access: Access::Write,
-            create: Create::Create,
-            direct: false,
-            ..Default::default()
-        },
-    )?;
+    let mut sink = sirocco_sys::align::AlignedBlock::new(CHUNK, false)?;
+
+    // The first attempt asks for `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` so the
+    // numbers describe the device rather than the page cache. Filesystems that
+    // refuse it (most network shares) get the buffered fallback.
+    let (f, direct) = match open_calib(&path, true) {
+        | Ok(f) => (f, true),
+        | Err(_) => (open_calib(&path, false)?, false),
+    };
+
     let t0 = Instant::now();
     let mut off = 0u64;
-    while off < size {
-        f.pwrite(&buf, off)?;
-        off += buf.len() as u64;
+    while off < SIZE {
+        write_all_at(&f, src.as_slice(), off)?;
+        off += CHUNK as u64;
     }
+    // Includes the device flush: a rate that excluded it would describe RAM.
     f.flush()?;
-    let w = size as f64 / t0.elapsed().as_secs_f64();
+    let w = SIZE as f64 / t0.elapsed().as_secs_f64();
 
     let t1 = Instant::now();
     let mut off = 0u64;
-    while off < size {
-        f.pread(&mut buf, off)?;
-        off += buf.len() as u64;
+    while off < SIZE {
+        read_all_at(&f, sink.as_mut_slice(), off)?;
+        off += CHUNK as u64;
     }
-    let r = size as f64 / t1.elapsed().as_secs_f64();
+    let r = SIZE as f64 / t1.elapsed().as_secs_f64();
     drop(f);
-    let _ = std::fs::remove_file(&path);
-    Ok(IoProfile::new(r, w, r))
+
+    // A buffered read-back is served from the page cache and would report several
+    // GB/s on any machine, which makes the delta cost model think comparing is
+    // free. Without direct I/O the write rate is the honest stand-in: it is a
+    // measured device rate, never an optimistic one.
+    let dest_read = if direct { r } else { r.min(w) };
+    Ok(IoProfile::new(r, w, dest_read))
+}
+
+/// A temporary file that deletes itself, so no early return can leave a 64 MiB
+/// file behind in the user's destination.
+struct CalibFile(PathBuf);
+
+impl Drop for CalibFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The nearest existing directory at or above `path`.
+///
+/// A destination that does not exist yet is the common case: the user types a
+/// new folder name and presses Measure before pressing Start.
+fn measure_dir(path: &Path) -> std::io::Result<PathBuf> {
+    let start = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    let mut cur = Some(start);
+    while let Some(p) = cur {
+        let p = if p.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            p
+        };
+        if p.is_dir() {
+            return Ok(p.to_path_buf());
+        }
+        cur = p.parent();
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("no existing directory at or above {}", path.display()),
+    ))
+}
+
+fn open_calib(
+    path: &Path,
+    direct: bool,
+) -> std::io::Result<RawFile> {
+    RawFile::open(
+        path,
+        &OpenOpts {
+            // Read *and* write: the same handle measures both directions. Opening
+            // write-only made every calibration fail at the read-back step.
+            access: Access::ReadWrite,
+            create: Create::Create,
+            direct,
+            sequential: true,
+            ..OpenOpts::default()
+        },
+    )
+}
+
+fn write_all_at(
+    f: &RawFile,
+    buf: &[u8],
+    off: u64,
+) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = f.pwrite(&buf[done..], off + done as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "calibration write made no progress",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
+fn read_all_at(
+    f: &RawFile,
+    buf: &mut [u8],
+    off: u64,
+) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = f.pread(&mut buf[done..], off + done as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "calibration read came back short",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
 }

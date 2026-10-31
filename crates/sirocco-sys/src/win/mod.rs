@@ -1446,6 +1446,70 @@ pub fn is_elevated() -> bool {
     ok != 0 && info.TokenIsElevated != 0
 }
 
+/// Re-launch this executable through the shell's `runas` verb.
+///
+/// `set_privileges` can only *enable* privileges the token already carries; a
+/// process started from a normal user session does not carry
+/// `SeManageVolumePrivilege` or `SeLockMemoryPrivilege` at all, so asking for
+/// them there is a no-op that looks like a bug. The only way up is a new
+/// process with a UAC prompt, which is what this does.
+///
+/// Returns once the shell has started the elevated process; the caller is
+/// expected to exit. A user who dismisses the UAC prompt gets
+/// [`io::ErrorKind::PermissionDenied`], which is a decision, not a failure.
+///
+/// # Errors
+///
+/// Returns the shell's error code when the prompt could not be shown, and
+/// [`io::ErrorKind::PermissionDenied`] when the user declined.
+pub fn relaunch_elevated(args: &[String]) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let file: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let op: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
+    // The shell parses this string itself, so every argument has to survive a
+    // round trip through the command line: quote, and double any trailing
+    // backslash that would otherwise escape the closing quote.
+    let mut params = String::new();
+    for a in args {
+        if !params.is_empty() {
+            params.push(' ');
+        }
+        let trailing = a.len() - a.trim_end_matches('\\').len();
+        params.push('"');
+        params.push_str(a);
+        for _ in 0..trailing {
+            params.push('\\');
+        }
+        params.push('"');
+    }
+    let wide: Vec<u16> = OsStr::new(&params)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both strings are NUL-terminated and outlive the call; the shell
+    // only reads them. `hwnd`/`lpDirectory` are documented as optional.
+    let rc = unsafe {
+        ffi::ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            ffi::SW_SHOWNORMAL,
+        )
+    };
+    if rc > ffi::SHELLEXEC_SUCCESS_MIN {
+        return Ok(());
+    }
+    // 5 is SE_ERR_ACCESSDENIED, which is what a cancelled UAC prompt returns.
+    let code = if rc == 5 { 5 } else { rc as i32 };
+    Err(io::Error::from_raw_os_error(code))
+}
+
 /// Probe every privilege we know how to use and record the ones that stuck.
 #[must_use]
 pub fn detect_caps() -> crate::caps::Caps {

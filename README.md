@@ -123,23 +123,44 @@ with the reason.
 | Group | What is there |
 |---|---|
 | Mode | Copy / Move / Mirror (the last two show an irreversible-action warning) |
-| Paths | Source and destination, each with a browse button; folders can be dropped on the window |
+| Sources | A list: add one or several files, one or several folders, type a path, or drop them on the window. Several sources are nested into the destination, each under its own name |
+| Destination | A path, or a folder picker. With several sources it is the folder they land in |
 | Options | hard links, sparse holes, permissions and ACL, block index, resume, flush on close, preview |
 | Verify | off / size / size + time / hash / sample |
 | Overwrite | 7 policies |
 | Filter | exclude and include globs, scan order (walk / small first / large first / physical / by name) |
 | Parallelism | I/O thread count (`0` = adaptive; the label shows how it resolved into readers and writers) |
+| Advanced | one toggle opens the engine, concurrency, delta, scheduling, fidelity, filter and privilege settings |
 
-There are exactly two channels between the UI and the engine, and neither adds a
-thread: the GUI allocates an `Arc<Stats>`, hands it to `session::run_with()`, and
-the engine's counters land in that memory, which the UI reads every 90 ms. Per-file
-events go over an `mpsc` channel and are drained in the same tick.
+Several sources run one after another, and the window shows the total: the
+progress bar and the file count cover the whole request, not just the source in
+flight.
 
-**Deliberately not in the GUI** (all still available on the CLI): `--procs`
-multi-process splitting (it re-executes the binary with a manifest — batch
-territory), `delete` mode (a delete button in a GUI is a disaster waiting for a
-mis-click), multiple sources, NUMA / affinity / buffer tuning, compression, and
-extended attributes. The reasoning is in DESIGN.md §15.5.
+The window reads the engine's counters straight out of shared memory and drains
+per-file events once per frame, so the display keeps up while the engine saturates
+the disk — no polling thread, no message per counter.
+
+Two controls are actions rather than settings:
+
+- **Measure destination speed** — writes a 64 MiB temporary file to the
+  destination and reads it back, then removes it. Do this before a delta run when
+  the destination is slower than the source (a network share, a USB disk): with a
+  measurement the engine can tell that comparing is cheaper than copying, without
+  one it assumes equal media and copies in full.
+- **Restart as administrator** — reopens the window elevated, with the sources and
+  destination you already picked. Some fast paths (instant allocation, large
+  pages, reading files whose ACL denies you) need privileges that a normal user
+  session does not have; the rail shows how many of them the current process
+  actually holds.
+
+The app opens a window and nothing else: no console. If it cannot start, or a copy
+hits an internal error, the reason is written to
+`%LOCALAPPDATA%\Sirocco\sirocco-gui.log`.
+
+**Not in the GUI** (still on the command line): `--procs` multi-process splitting,
+`delete` mode, and `-v` / `--json`. Everything else — I/O shape, scheduling,
+privileges, fidelity, filters, the block index, delta tuning — is in the rail,
+under the settings toggle.
 
 `Esc` stops the current job.
 

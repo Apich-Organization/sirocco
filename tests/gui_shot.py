@@ -7,13 +7,14 @@ misses the job.
 
 import ctypes
 import ctypes.wintypes as wt
+import os
 import subprocess
 import sys
 import time
 
 from PIL import ImageGrab
 
-EXE = r"D:/dev/fc-rs/target/release/sirocco-gui.exe"
+EXE = os.environ.get("SIROCCO_GUI_EXE", r"D:/dev/fc-rs/target/release/sirocco-gui.exe")
 
 
 def find_window(timeout=25.0):
@@ -41,6 +42,10 @@ def find_window(timeout=25.0):
 
 def capture(hwnd, path):
     u = ctypes.windll.user32
+    # A window that was minimised (or hidden by the foreground grab below) has no
+    # client area to grab, and ImageGrab then returns a tile that cannot be saved.
+    SW_RESTORE = 9
+    u.ShowWindow(hwnd, SW_RESTORE)
     # A synthetic ALT tap unlocks SetForegroundWindow for the calling process.
     u.keybd_event(0x12, 0, 0, 0)
     u.keybd_event(0x12, 0, 2, 0)
@@ -72,8 +77,6 @@ def main():
         "SIROCCO_GUI_SRC": src,
         "SIROCCO_GUI_DST": dst,
     }
-    import os
-
     subprocess.Popen([EXE], env={**os.environ, **env}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     hwnd = find_window()
     if not hwnd:

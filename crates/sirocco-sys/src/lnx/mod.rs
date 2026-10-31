@@ -1185,6 +1185,32 @@ fn effective_caps() -> u64 {
     0
 }
 
+/// Is the process running as root?
+///
+/// The GUI uses this to explain *why* a privilege request granted nothing: on
+/// Linux the capabilities are attached to the credentials at exec time, so
+/// there is no "enable" step to offer.
+#[must_use]
+pub fn is_elevated() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Re-launching with elevated rights is a Windows concept.
+///
+/// On Linux the equivalent is starting the binary under `sudo`, which the
+/// process cannot do to itself without a terminal; the GUI says so instead of
+/// pretending.
+///
+/// # Errors
+///
+/// Always [`io::ErrorKind::Unsupported`].
+pub fn relaunch_elevated(_args: &[String]) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "start the binary under sudo to run it with elevated rights",
+    ))
+}
+
 /// Which privileged operations this process can actually perform.
 ///
 /// The answer is a probe, not a promise: `fallocate` is unprivileged but the

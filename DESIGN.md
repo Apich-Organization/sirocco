@@ -671,6 +671,96 @@ Everything else — I/O shape, scheduling, privileges, fidelity, filters, the bl
 index, delta tuning — is reachable from the rail, grouped so that the common case
 is visible and the rest is one click away.
 
+### 15.6 Several sources are a sequence, not a merged plan
+
+The window accepts a list of sources: files, folders, or a mix. Each one is a
+separate session — `[a, b, c] → dst/a, dst/b, dst/c` — because `run_with` owns one
+source root and one destination, and the journal, the `Move` rename path and the
+volume comparison all assume that.
+
+The alternative, merging several scans into one plan, would put more than one
+source root inside the pipeline. The engine would have to carry a root per entry
+for the journal key, decide per entry whether a rename is legal, and compare
+volumes per entry instead of per run. A sequence costs one scan and one pipeline
+startup per source, which is noise next to the copy itself.
+
+The window does the arithmetic: `Totals` keeps the counters of the finished
+sessions and merges them with the live one every frame. The progress bar and the
+FILES card therefore describe the whole request, and a second source does not
+reset them to zero.
+
+Three details follow from the sequence and are visible in the UI:
+
+- Feed rows carry the source name only when there is more than one source. Two
+  sources can both contain `a/b.txt`; with one source the prefix would push the
+  interesting part of the path out of the row.
+- A stop request is a shared flag checked between sources, in addition to the
+  engine's process-wide interrupt. Each session resets that interrupt when it
+  starts, so a Stop pressed at a source boundary would otherwise be swallowed.
+- `into` is `cp -r` semantics for a single folder, so it is only forwarded when
+  the request is exactly one folder. With several sources the nesting is already
+  implied by the destination join.
+
+### 15.7 Measuring the destination
+
+The delta cost model decides whether comparing blocks is cheaper than copying
+them, and that decision needs the read and write rates of both sides. Without a
+measurement it assumes an ordinary SATA SSD on both ends, which correctly rules
+delta out between equal media but cannot recognise a destination that is ten times
+slower than the source — the case where delta pays.
+
+The measurement writes 64 MiB and reads it back. Three properties make the number
+mean what the model needs:
+
+- **It happens where the copy will write.** The destination is often a folder that
+  does not exist yet, or the target file of a single-file copy; the measurement
+  runs in the nearest existing directory at or above it, which is the volume the
+  bytes will land on.
+- **It bypasses the page cache.** `O_DIRECT` / `FILE_FLAG_NO_BUFFERING` with an
+  aligned buffer, so the read describes the device. A cache-served read reports
+  several GB/s on any machine, which would tell the model that comparing is free.
+  Filesystems that refuse direct I/O get the buffered path, and the read rate is
+  then reported as the write rate: a measured device rate, never an optimistic
+  one.
+- **It leaves nothing behind.** The temporary file is removed on every exit path,
+  including an error, and a failure is shown with its reason rather than as a
+  boolean. Changing the destination discards the result, because it describes a
+  different volume.
+
+### 15.8 Privileges and elevation
+
+Three engine paths want privileges: instant allocation of the destination
+(`SetFileValidData` / `fallocate`), large pages for the buffer pool, and reading
+files whose ACL denies the user (backup semantics).
+
+On Windows the privileges have to be in the process token and then enabled on it.
+A token from an ordinary user session does not contain `SeManageVolumePrivilege`
+or `SeLockMemoryPrivilege` at all, so enabling them is a no-op no matter how many
+times it is asked. The rail therefore reports how many of the four it actually
+holds — `1 of 4 privileges enabled: SeLockMemoryPrivilege` — and offers the only
+step that can change the answer: re-launching the executable through the shell's
+`runas` verb, carrying the sources and destination as arguments so the form
+survives.
+
+On Linux the capabilities come from the credentials at exec time and there is no
+enable step, so the rail says to start the binary under `sudo` rather than
+offering a button that would change nothing.
+
+The unprivileged paths stay available throughout: the engine falls back to
+hole-based extension and normal pages, which is slower, not wrong.
+
+### 15.9 A window, not a console
+
+The desktop binary is built as a GUI-subsystem executable on Windows, so starting
+it from Explorer or a shortcut produces a window and no terminal. The attribute is
+conditional on `not(test)`: the test harness prints to stdout, and a GUI-subsystem
+test binary would lose that output.
+
+A process with no console also has nowhere to print a panic or a startup failure,
+so `main` installs a panic hook that appends the message and a backtrace to
+`%LOCALAPPDATA%\Sirocco\sirocco-gui.log`, and writes the error from `iced::run`
+there when the window cannot be created at all.
+
 ## 16. Measurements
 
 Machine: i7-11800H (8C16T), cloud-synced NVMe (write bandwidth ≈ 160 MB/s, which

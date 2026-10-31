@@ -297,8 +297,6 @@ pub struct EngineConfig {
     pub small_threshold: u64,
     /// Whether the kernel fast path is allowed at all.
     pub small_copy: SmallCopy,
-    /// How many small files to hand to the kernel in one batch.
-    pub small_batch: usize,
     /// Flush the destination to the device before reporting success.
     pub sync_at_end: bool,
     /// Restore the source's modification time on the destination.
@@ -378,7 +376,6 @@ impl Default for EngineConfig {
             io_profile: None,
             small_threshold: 256 << 10,
             small_copy: SmallCopy::Auto,
-            small_batch: 512,
             sync_at_end: false,
             keep_times: true,
             preserve_permissions: true,
@@ -462,7 +459,6 @@ impl EngineConfig {
             self.queue_depth = (self.readers + self.writers) * self.overlap;
         }
         self.queue_depth = self.queue_depth.clamp(8, 1 << 20);
-        self.small_batch = self.small_batch.clamp(1, 65536);
         // Comparison granularity must equal transfer granularity: the block
         // hashes stored in the persistent index are produced by the reader at
         // `io_unit` size, and the delta paths compare at the same size.

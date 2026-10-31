@@ -287,12 +287,6 @@ pub fn parse(argv: &[String]) -> R<Cli> {
             | "--small" => {
                 c.cfg.small_threshold = size_of(&val("--small")?, "--small")?;
             },
-            | "--small-batch" => {
-                c.cfg.small_batch = val("--small-batch")?
-                    .parse()
-                    .map_err(|_| ParseError("--small-batch expects a number".into()))?;
-            },
-
             | "--pin" => c.cfg.pin_threads = true,
             | "--feeders" => {
                 c.cfg.feeders = val("--feeders")?

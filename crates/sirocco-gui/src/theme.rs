@@ -118,6 +118,22 @@ pub fn rule(_t: &Theme) -> container::Style {
     }
 }
 
+/// A recessed well: the list of picked sources, and the empty state that stands
+/// in for it. One step *below* the rail, so a list of paths reads as content
+/// rather than as another control.
+pub fn well(_t: &Theme) -> container::Style {
+    container::Style {
+        background: Some(BG.into()),
+        text_color: Some(TEXT),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: R_CTRL.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// A tinted tile: status pills, row badges.
 pub fn chip(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| {
